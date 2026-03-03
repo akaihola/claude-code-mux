@@ -9,7 +9,7 @@ use crate::auth::TokenStore;
 use crate::message_tracing::MessageTracer;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{
         Html, IntoResponse, Response,
@@ -152,6 +152,10 @@ pub async fn start_server(config: AppConfig, config_path: std::path::PathBuf) ->
         .route("/api/oauth/tokens", get(oauth_handlers::oauth_list_tokens))
         .route("/api/oauth/tokens/delete", post(oauth_handlers::oauth_delete_token))
         .route("/api/oauth/tokens/refresh", post(oauth_handlers::oauth_refresh_token));
+
+    // Remove axum's default 2MB body limit – long AI sessions easily exceed it.
+    // The upstream Anthropic API enforces its own limits; no cap needed here.
+    let app = app.layer(DefaultBodyLimit::disable());
 
     // Clone state before moving it
     let oauth_state = state.clone();
