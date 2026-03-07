@@ -203,6 +203,159 @@ struct ResponsesUsage {
     output_tokens: u32,
 }
 
+/// ChatGPT /codex/responses API streaming chunk
+/// This is a different format from standard OpenAI streaming
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ChatGptResponsesChunk {
+    #[serde(rename = "type")]
+    chunk_type: String,
+    // For response.output_text.delta
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    content_index: Option<u32>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    output_index: Option<u32>,
+    // For response.completed
+    #[serde(default)]
+    response: Option<serde_json::Value>,
+}
+
+/// Transform ChatGPT /codex/responses SSE format to Anthropic SSE format
+/// This handles the ChatGPT-specific event types like:
+/// - response.output_text.delta -> content_block_delta (text)
+/// - response.completed -> message_delta + message_stop
+fn transform_chatgpt_responses_sse(
+    chunk: &ChatGptResponsesChunk,
+    message_id: &str,
+    state: &mut StreamTransformState,
+) -> String {
+    let mut output = String::new();
+
+    match chunk.chunk_type.as_str() {
+        "response.created" | "response.in_progress" => {
+            // First event: emit message_start
+            if !state.message_started {
+                state.message_started = true;
+                let message_start = serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0
+                        }
+                    }
+                });
+                output.push_str(&format!("event: message_start\ndata: {}\n\n", message_start));
+            }
+        }
+        "response.output_item.added" => {
+            // New output item - emit content_block_start for text
+            if !state.text_block_open {
+                state.text_block_open = true;
+                state.text_block_index = state.next_block_index;
+                state.next_block_index += 1;
+                let block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": state.text_block_index,
+                    "content_block": {
+                        "type": "text",
+                        "text": ""
+                    }
+                });
+                output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
+            }
+        }
+        "response.output_text.delta" => {
+            // Text content delta
+            if let Some(ref text) = chunk.delta {
+                // Open text block if not already open
+                if !state.text_block_open {
+                    state.text_block_open = true;
+                    state.text_block_index = state.next_block_index;
+                    state.next_block_index += 1;
+                    let block_start = serde_json::json!({
+                        "type": "content_block_start",
+                        "index": state.text_block_index,
+                        "content_block": {
+                            "type": "text",
+                            "text": ""
+                        }
+                    });
+                    output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
+                }
+
+                let delta = serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": state.text_block_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": text
+                    }
+                });
+                output.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
+            }
+        }
+        "response.completed" => {
+            // Stream complete - emit termination sequence
+            state.stream_ended = true;
+
+            // Close text block if open
+            if state.text_block_open {
+                let block_stop = serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": state.text_block_index
+                });
+                output.push_str(&format!("event: content_block_stop\ndata: {}\n\n", block_stop));
+            }
+
+            // Extract usage from response.completed
+            let mut input_tokens = 0u32;
+            let mut output_tokens = 0u32;
+            if let Some(ref response) = chunk.response {
+                if let Some(usage) = response.get("usage") {
+                    input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                }
+            }
+
+            // Emit message_delta
+            let message_delta = serde_json::json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            });
+            output.push_str(&format!("event: message_delta\ndata: {}\n\n", message_delta));
+
+            // Emit message_stop
+            let message_stop = serde_json::json!({
+                "type": "message_stop"
+            });
+            output.push_str(&format!("event: message_stop\ndata: {}\n\n", message_stop));
+        }
+        // Ignore other event types (response.output_text.done, response.content_part.done, etc.)
+        _ => {}
+    }
+
+    output
+}
+
 /// OpenAI Streaming Chunk (for SSE transformation)
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -1543,6 +1696,9 @@ impl AnthropicProvider for OpenAIProvider {
         let state = Arc::new(Mutex::new(StreamTransformState::default()));
         let state_for_cleanup = state.clone();
 
+        // Flag for using ChatGPT responses API format (OAuth + responses endpoint)
+        let use_chatgpt_format = self.is_oauth() && use_responses_api;
+
         // Convert response bytes stream to SSE events
         let sse_stream = SseStream::new(response.bytes_stream());
 
@@ -1555,6 +1711,7 @@ impl AnthropicProvider for OpenAIProvider {
             let message_id = message_id.clone();
             let state = state.clone();
             let provider_name = provider_name.clone();
+            let use_chatgpt_format = use_chatgpt_format;
 
             async move {
                 match result {
@@ -1592,33 +1749,67 @@ impl AnthropicProvider for OpenAIProvider {
                             });
                         }
 
-                        // Parse OpenAI chunk
-                        match serde_json::from_str::<OpenAIStreamChunk>(&sse_event.data) {
-                            Ok(chunk) => {
-                                tracing::debug!("✨ Transforming chunk with {} choices", chunk.choices.len());
+                        // Use ChatGPT format for OAuth + responses API, standard OpenAI format otherwise
+                        if use_chatgpt_format {
+                            // Parse ChatGPT /codex/responses format
+                            match serde_json::from_str::<ChatGptResponsesChunk>(&sse_event.data) {
+                                Ok(chunk) => {
+                                    tracing::debug!("✨ Transforming ChatGPT responses chunk: {}", chunk.chunk_type);
 
-                                // Transform to Anthropic format (raw SSE bytes)
-                                let sse_output = Self::transform_openai_chunk_to_anthropic_sse(
-                                    &chunk,
-                                    &message_id,
-                                    &mut *state.lock().unwrap()
-                                );
+                                    // Transform to Anthropic format (raw SSE bytes)
+                                    let sse_output = transform_chatgpt_responses_sse(
+                                        &chunk,
+                                        &message_id,
+                                        &mut *state.lock().unwrap()
+                                    );
 
-                                if !sse_output.is_empty() {
-                                    tracing::debug!("SSE: {} bytes", sse_output.len());
-                                } else {
-                                    tracing::debug!("SSE: empty output (will be filtered)");
+                                    if !sse_output.is_empty() {
+                                        tracing::debug!("SSE: {} bytes", sse_output.len());
+                                    } else {
+                                        tracing::debug!("SSE: empty output (will be filtered)");
+                                    }
+
+                                    // Return as raw bytes (already SSE-formatted)
+                                    Ok(Bytes::from(sse_output))
                                 }
-
-                                // Return as raw bytes (already SSE-formatted)
-                                Ok(Bytes::from(sse_output))
+                                Err(e) => {
+                                    // Silently skip unknown event types from ChatGPT
+                                    tracing::debug!(
+                                        "⏭️ Skipping unparseable ChatGPT chunk: {} - Data: {}",
+                                        e, &sse_event.data[..sse_event.data.len().min(200)]
+                                    );
+                                    Ok(Bytes::new())
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "❌ {} failed to parse chunk: {} - Data: {}",
-                                    provider_name, e, sse_event.data
-                                );
-                                Ok(Bytes::new())
+                        } else {
+                            // Parse standard OpenAI chunk
+                            match serde_json::from_str::<OpenAIStreamChunk>(&sse_event.data) {
+                                Ok(chunk) => {
+                                    tracing::debug!("✨ Transforming chunk with {} choices", chunk.choices.len());
+
+                                    // Transform to Anthropic format (raw SSE bytes)
+                                    let sse_output = Self::transform_openai_chunk_to_anthropic_sse(
+                                        &chunk,
+                                        &message_id,
+                                        &mut *state.lock().unwrap()
+                                    );
+
+                                    if !sse_output.is_empty() {
+                                        tracing::debug!("SSE: {} bytes", sse_output.len());
+                                    } else {
+                                        tracing::debug!("SSE: empty output (will be filtered)");
+                                    }
+
+                                    // Return as raw bytes (already SSE-formatted)
+                                    Ok(Bytes::from(sse_output))
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "❌ {} failed to parse chunk: {} - Data: {}",
+                                        provider_name, e, sse_event.data
+                                    );
+                                    Ok(Bytes::new())
+                                }
                             }
                         }
                     }
