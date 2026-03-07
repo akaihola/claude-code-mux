@@ -42,11 +42,21 @@ struct OpenAIRequest {
     tool_choice: Option<serde_json::Value>,
 }
 
-/// OpenAI Responses API request format (for Codex models)
+/// OpenAI Responses API request format (for Codex / ChatGPT OAuth models)
+///
+/// `input` is a flat ordered list of conversation items serialized as JSON objects:
+///   - chat turns:             `{"role": "user"|"assistant", "content": "..."}`
+///   - model tool invocation:  `{"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}`
+///   - tool result from user:  `{"type": "function_call_output", "call_id": "...", "output": "..."}`
+///
+/// `tools` is an array of function definitions when the model should be able to call tools:
+///   `{"type": "function", "name": "...", "description": "...", "parameters": {...}}`
+///
+/// Note: ChatGPT Codex does NOT support max_output_tokens, max_tokens, temperature, top_p, stop
 #[derive(Debug, Serialize)]
 struct OpenAIResponsesRequest {
     model: String,
-    input: OpenAIResponsesInput,
+    input: Vec<serde_json::Value>,
     /// System instructions for the model (required for ChatGPT Codex)
     instructions: String,
     /// Whether to store the conversation (must be false for ChatGPT backend)
@@ -55,66 +65,7 @@ struct OpenAIResponsesRequest {
     stream: bool,
     /// Tool definitions (function calling support)
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<OpenAIResponsesTool>>,
-    // Note: ChatGPT Codex does NOT support max_output_tokens, max_tokens, temperature, top_p, stop
-}
-
-/// Tool definition for Responses API
-#[derive(Debug, Serialize)]
-struct OpenAIResponsesTool {
-    r#type: String,  // "function"
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parameters: Option<serde_json::Value>,
-}
-
-/// Input for Responses API — an ordered list of conversation items
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-#[allow(dead_code)]
-enum OpenAIResponsesInput {
-    Text(String),
-    Items(Vec<OpenAIResponsesItem>),
-}
-
-/// A single item in the Responses API input array.
-/// Can be a chat message, a function call (assistant), or a function result (user).
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum OpenAIResponsesItem {
-    /// Normal chat turn: { role, content }
-    Message(OpenAIResponsesMessage),
-    /// Tool invocation emitted by the model: { type, call_id, name, arguments }
-    FunctionCall(OpenAIResponsesFunctionCall),
-    /// Tool result provided by the caller: { type, call_id, output }
-    FunctionCallOutput(OpenAIResponsesFunctionCallOutput),
-}
-
-/// Message format for Responses API
-#[derive(Debug, Serialize)]
-struct OpenAIResponsesMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-}
-
-/// Function call item (emitted by the model, replayed in input for multi-turn)
-#[derive(Debug, Serialize)]
-struct OpenAIResponsesFunctionCall {
-    r#type: String,   // "function_call"
-    call_id: String,
-    name: String,
-    arguments: String,
-}
-
-/// Function call result item (provided by caller)
-#[derive(Debug, Serialize)]
-struct OpenAIResponsesFunctionCallOutput {
-    r#type: String,   // "function_call_output"
-    call_id: String,
-    output: String,
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 /// Content can be string or array of content parts
@@ -568,25 +519,10 @@ impl OpenAIProvider {
         model.to_lowercase().contains("codex")
     }
 
-    /// Responses API support is narrower than the generic chat-completions path.
-    /// In particular, our current Responses API serializer is text/tool-only and
-    /// does not preserve image blocks, so OAuth requests with images must stay on
-    /// the chat-completions path until multimodal support is implemented there too.
-    fn request_can_use_responses_api(request: &AnthropicRequest) -> bool {
-        request.messages.iter().all(|msg| match &msg.content {
-            MessageContent::Text(_) => true,
-            MessageContent::Blocks(blocks) => blocks.iter().all(|block| {
-                !matches!(block, ContentBlock::Known(KnownContentBlock::Image { .. }))
-            }),
-        })
-    }
-
     fn should_use_responses_api(&self, request: &AnthropicRequest) -> bool {
-        if self.is_oauth() {
-            Self::request_can_use_responses_api(request)
-        } else {
-            Self::is_codex_model(&request.model)
-        }
+        // OAuth must use /codex/responses — chatgpt.com has no /chat/completions endpoint.
+        // Vision: API-key models (e.g. gpt-5.4) use /chat/completions and support images; OAuth drops them silently.
+        self.is_oauth() || Self::is_codex_model(&request.model)
     }
 
     /// Parse SSE (Server-Sent Events) response from ChatGPT Codex (non-streaming path).
@@ -658,44 +594,33 @@ impl OpenAIProvider {
         })
     }
 
-    /// Transform Anthropic request to OpenAI Responses API format
+    /// Transform Anthropic request to OpenAI Responses API format.
+    ///
+    /// Responses API uses a flat ordered list of items (messages, function_call, function_call_output)
+    /// rather than the nested role/content structure of chat completions.  Tool call multi-turn
+    /// history is replayed by inserting function_call and function_call_output items in order.
+    /// Image blocks are skipped (Responses API is text/tool-only for now).
     fn transform_to_responses_request(&self, request: &AnthropicRequest) -> Result<OpenAIResponsesRequest, ProviderError> {
-        // Use official Codex instructions (system message is handled separately in user messages if needed)
-        let instructions = CODEX_INSTRUCTIONS.to_string();
+        let mut items: Vec<serde_json::Value> = Vec::new();
 
-        // Convert messages to Responses API input format
-        let mut items: Vec<OpenAIResponsesItem> = Vec::new();
-
-        // Add system message as a user message if present (Codex doesn't have separate system role)
+        // System prompt → prepend as user message (Codex has no separate system role)
         if let Some(ref system) = request.system {
             let system_text = match system {
                 crate::models::SystemPrompt::Text(text) => text.clone(),
                 crate::models::SystemPrompt::Blocks(blocks) => {
-                    blocks.iter()
-                        .map(|b| b.text.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>().join("\n")
                 }
             };
-            // Prepend system message as user message
-            items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
-                role: "user".to_string(),
-                content: Some(system_text),
-            }));
+            items.push(serde_json::json!({"role": "user", "content": system_text}));
         }
 
-        // Transform messages — Anthropic multi-turn with tool use becomes a flat item list
+        // Anthropic multi-turn → flat Responses API item list
         for msg in &request.messages {
             match &msg.content {
                 MessageContent::Text(text) => {
-                    items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
-                        role: msg.role.clone(),
-                        content: Some(text.clone()),
-                    }));
+                    items.push(serde_json::json!({"role": msg.role, "content": text}));
                 }
                 MessageContent::Blocks(blocks) => {
-                    // Collect text and tool_use blocks for the assistant turn,
-                    // plus tool_result blocks which become function_call_output items.
                     let mut text_parts: Vec<String> = Vec::new();
 
                     for block in blocks {
@@ -704,89 +629,73 @@ impl OpenAIProvider {
                                 text_parts.push(text.clone());
                             }
                             ContentBlock::Known(KnownContentBlock::ToolUse { id, name, input }) => {
-                                // Emit the text so far as an assistant message
+                                // Flush accumulated text before the function_call item
                                 let combined = text_parts.join("\n");
                                 text_parts.clear();
                                 if !combined.is_empty() {
-                                    items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
-                                        role: "assistant".to_string(),
-                                        content: Some(combined),
-                                    }));
+                                    items.push(serde_json::json!({"role": "assistant", "content": combined}));
                                 }
-                                // Emit the function_call item (replaying what the model generated)
-                                items.push(OpenAIResponsesItem::FunctionCall(OpenAIResponsesFunctionCall {
-                                    r#type: "function_call".to_string(),
-                                    call_id: id.clone(),
-                                    name: name.clone(),
-                                    arguments: serde_json::to_string(input).unwrap_or_default(),
+                                items.push(serde_json::json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input).unwrap_or_default(),
                                 }));
                             }
                             ContentBlock::Known(KnownContentBlock::ToolResult { tool_use_id, content, is_error, .. }) => {
-                                // Emit any pending text from this user turn first
+                                // Flush any preceding text in this turn
                                 let combined = text_parts.join("\n");
                                 text_parts.clear();
                                 if !combined.is_empty() {
-                                    items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
-                                        role: msg.role.clone(),
-                                        content: Some(combined),
-                                    }));
+                                    items.push(serde_json::json!({"role": msg.role, "content": combined}));
                                 }
-                                // tool_use_id maps directly to call_id
                                 let output = if *is_error {
                                     format!("[error] {}", content.to_string())
                                 } else {
                                     content.to_string()
                                 };
-                                items.push(OpenAIResponsesItem::FunctionCallOutput(OpenAIResponsesFunctionCallOutput {
-                                    r#type: "function_call_output".to_string(),
-                                    call_id: tool_use_id.clone(),
-                                    output,
+                                items.push(serde_json::json!({
+                                    "type": "function_call_output",
+                                    "call_id": tool_use_id,
+                                    "output": output,
                                 }));
                             }
-                            ContentBlock::Known(KnownContentBlock::Thinking { .. }) |
-                            ContentBlock::Known(KnownContentBlock::Image { .. }) |
-                            ContentBlock::Unknown(_) => {
-                                // Skip unsupported block types
+                            // Image, thinking, and unknown blocks are not supported by Responses API
+                            ContentBlock::Known(KnownContentBlock::Image { .. }) => {
+                                tracing::warn!("Skipping image block in Responses API request (not supported)");
                             }
+                            ContentBlock::Known(KnownContentBlock::Thinking { .. }) |
+                            ContentBlock::Unknown(_) => {}
                         }
                     }
 
-                    // Flush any remaining text parts as a message
+                    // Flush remaining text
                     let combined = text_parts.join("\n");
                     if !combined.is_empty() {
-                        items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
-                            role: msg.role.clone(),
-                            content: Some(combined),
-                        }));
+                        items.push(serde_json::json!({"role": msg.role, "content": combined}));
                     }
                 }
             }
         }
 
-        // Convert Anthropic tool definitions to Responses API tool format
-        let tools = request.tools.as_ref().and_then(|anthropic_tools| {
-            if anthropic_tools.is_empty() {
-                None
-            } else {
-                Some(anthropic_tools.iter()
-                    .filter_map(|tool| {
-                        Some(OpenAIResponsesTool {
-                            r#type: "function".to_string(),
-                            name: tool.name.as_ref()?.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.input_schema.clone(),
-                        })
-                    })
-                    .collect::<Vec<_>>())
-            }
+        // Convert Anthropic tool definitions to Responses API format
+        let tools = request.tools.as_ref().filter(|t| !t.is_empty()).map(|anthropic_tools| {
+            anthropic_tools.iter().filter_map(|tool| {
+                Some(serde_json::json!({
+                    "type": "function",
+                    "name": tool.name.as_ref()?,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }))
+            }).collect::<Vec<_>>()
         });
 
         Ok(OpenAIResponsesRequest {
             model: request.model.clone(),
-            input: OpenAIResponsesInput::Items(items),
-            instructions,
-            store: false,  // Required: ChatGPT backend requires store=false
-            stream: true,  // Required: ChatGPT Codex requires stream=true
+            input: items,
+            instructions: CODEX_INSTRUCTIONS.to_string(),
+            store: false,  // ChatGPT backend requires store=false
+            stream: true,  // ChatGPT Codex requires stream=true
             tools,
         })
     }
@@ -2309,7 +2218,18 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_image_requests_do_not_use_responses_api() {
+    fn test_image_blocks_skipped_in_responses_api_serialization() {
+        // Image blocks are not supported by the Responses API serializer; they should be
+        // silently skipped so that the rest of the message is still forwarded.
+        let provider = OpenAIProvider::with_headers(
+            "test".to_string(),
+            "key".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
         let request: AnthropicRequest = serde_json::from_value(serde_json::json!({
             "model": "gpt-5.4",
             "max_tokens": 128,
@@ -2322,6 +2242,9 @@ mod tests {
             }]
         })).unwrap();
 
-        assert!(!OpenAIProvider::request_can_use_responses_api(&request));
+        let responses_req = provider.transform_to_responses_request(&request).unwrap();
+        // The image block should be dropped; only the text item should appear
+        assert_eq!(responses_req.input.len(), 1);
+        assert_eq!(responses_req.input[0]["content"], "describe this");
     }
 }
