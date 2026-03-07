@@ -1446,16 +1446,29 @@ impl AnthropicProvider for OpenAIProvider {
             &self.base_url
         };
 
-        // Check if this is a Codex model
-        let is_codex = Self::is_codex_model(&request.model);
+        // Check if we should use Responses API endpoint:
+        // - OAuth: Always use /codex/responses for all models (ChatGPT backend doesn't have /chat/completions)
+        // - API Key: Only use /responses for models containing "codex"
+        let use_responses_api = if self.is_oauth() {
+            true  // OAuth always uses Codex endpoint
+        } else {
+            Self::is_codex_model(&request.model)  // API Key only for codex models
+        };
 
-        let (url, request_body) = if is_codex {
+        let (url, request_body) = if use_responses_api {
             // Use /v1/responses endpoint for Codex models
-            tracing::debug!("Using /v1/responses endpoint for Codex model (streaming): {}", request.model);
+            tracing::debug!("Using /v1/responses endpoint (streaming): {}", request.model);
             let responses_request = self.transform_to_responses_request(&request)?;
             let body = serde_json::to_value(&responses_request)
                 .map_err(|e| ProviderError::SerializationError(e))?;
-            (format!("{}/responses", base_url), body)
+
+            // OAuth (ChatGPT Codex) uses /codex/responses, API Key uses /responses
+            let endpoint = if self.is_oauth() {
+                "/codex/responses"
+            } else {
+                "/responses"
+            };
+            (format!("{}{}", base_url, endpoint), body)
         } else {
             // Use standard /v1/chat/completions endpoint
             let openai_request = self.transform_request(&request)?;
@@ -1471,21 +1484,29 @@ impl AnthropicProvider for OpenAIProvider {
             .header("Content-Type", "application/json")
             .header("accept", "text/event-stream");
 
-        // For OAuth (ChatGPT Codex), add Codex-specific headers
-        if self.is_oauth() && is_codex {
+        // For OAuth (ChatGPT backend), add all Codex-specific headers when using responses API
+        if self.is_oauth() && use_responses_api {
             if let Some(account_id) = Self::extract_account_id(&auth_value) {
                 req_builder = req_builder
                     .header("chatgpt-account-id", account_id)
                     .header("OpenAI-Beta", "responses=experimental")
-                    .header("originator", "codex_cli_rs");
-                tracing::debug!("🔐 Using OAuth Bearer token for ChatGPT Codex streaming on {}", self.name);
+                    .header("originator", "codex_cli_rs")
+                    // Browser-like headers to avoid Cloudflare bot detection
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                    .header("Origin", "https://chatgpt.com")
+                    .header("Referer", "https://chatgpt.com/")
+                    .header("sec-ch-ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+                    .header("sec-ch-ua-mobile", "?0")
+                    .header("sec-ch-ua-platform", "\"macOS\"")
+                    .header("sec-fetch-dest", "empty")
+                    .header("sec-fetch-mode", "cors")
+                    .header("sec-fetch-site", "same-origin");
+                tracing::debug!("🔐 Using OAuth Bearer token for ChatGPT streaming on {}", self.name);
             }
-        } else if self.is_oauth() {
-            // For non-Codex OAuth (if needed in the future)
-            if let Some(account_id) = Self::extract_account_id(&auth_value) {
-                req_builder = req_builder.header("chatgpt-account-id", account_id);
-                tracing::debug!("🔐 Using OAuth Bearer token for streaming on {}", self.name);
-            }
+        } else if use_responses_api {
+            // API Key + responses API (non-OAuth codex models)
+            req_builder = req_builder.header("OpenAI-Beta", "responses=experimental");
+            tracing::debug!("Using /v1/responses endpoint with API key for {}", self.name);
         }
 
         // Add custom headers (for OpenRouter, NovitaAI, etc.)
