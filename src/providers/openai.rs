@@ -53,16 +53,43 @@ struct OpenAIResponsesRequest {
     store: bool,
     /// Enable streaming responses
     stream: bool,
+    /// Tool definitions (function calling support)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAIResponsesTool>>,
     // Note: ChatGPT Codex does NOT support max_output_tokens, max_tokens, temperature, top_p, stop
 }
 
-/// Input for Responses API can be string or array of messages
+/// Tool definition for Responses API
+#[derive(Debug, Serialize)]
+struct OpenAIResponsesTool {
+    r#type: String,  // "function"
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<serde_json::Value>,
+}
+
+/// Input for Responses API — an ordered list of conversation items
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 #[allow(dead_code)]
 enum OpenAIResponsesInput {
     Text(String),
-    Messages(Vec<OpenAIResponsesMessage>),
+    Items(Vec<OpenAIResponsesItem>),
+}
+
+/// A single item in the Responses API input array.
+/// Can be a chat message, a function call (assistant), or a function result (user).
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum OpenAIResponsesItem {
+    /// Normal chat turn: { role, content }
+    Message(OpenAIResponsesMessage),
+    /// Tool invocation emitted by the model: { type, call_id, name, arguments }
+    FunctionCall(OpenAIResponsesFunctionCall),
+    /// Tool result provided by the caller: { type, call_id, output }
+    FunctionCallOutput(OpenAIResponsesFunctionCallOutput),
 }
 
 /// Message format for Responses API
@@ -71,6 +98,23 @@ struct OpenAIResponsesMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+}
+
+/// Function call item (emitted by the model, replayed in input for multi-turn)
+#[derive(Debug, Serialize)]
+struct OpenAIResponsesFunctionCall {
+    r#type: String,   // "function_call"
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Function call result item (provided by caller)
+#[derive(Debug, Serialize)]
+struct OpenAIResponsesFunctionCallOutput {
+    r#type: String,   // "function_call_output"
+    call_id: String,
+    output: String,
 }
 
 /// Content can be string or array of content parts
@@ -210,24 +254,34 @@ struct ResponsesUsage {
 struct ChatGptResponsesChunk {
     #[serde(rename = "type")]
     chunk_type: String,
-    // For response.output_text.delta
+    // For response.output_text.delta and response.function_call_arguments.delta
     #[serde(default)]
     delta: Option<String>,
     #[serde(default)]
     content_index: Option<u32>,
+    // item_id is the id of the output item (message or function_call)
     #[serde(default)]
     item_id: Option<String>,
     #[serde(default)]
     output_index: Option<u32>,
+    // For response.output_item.added and response.output_item.done
+    #[serde(default)]
+    item: Option<serde_json::Value>,
     // For response.completed
     #[serde(default)]
     response: Option<serde_json::Value>,
 }
 
-/// Transform ChatGPT /codex/responses SSE format to Anthropic SSE format
-/// This handles the ChatGPT-specific event types like:
-/// - response.output_text.delta -> content_block_delta (text)
-/// - response.completed -> message_delta + message_stop
+/// Transform ChatGPT /codex/responses SSE format to Anthropic SSE format.
+///
+/// ChatGPT event types handled:
+/// - response.created / response.in_progress       → message_start
+/// - response.output_item.added (message)          → content_block_start (text)
+/// - response.output_item.added (function_call)    → content_block_start (tool_use)
+/// - response.output_text.delta                    → content_block_delta (text_delta)
+/// - response.function_call_arguments.delta        → content_block_delta (input_json_delta)
+/// - response.output_item.done (function_call)     → content_block_stop + had_tool_calls=true
+/// - response.completed                            → content_block_stop + message_delta + message_stop
 fn transform_chatgpt_responses_sse(
     chunk: &ChatGptResponsesChunk,
     message_id: &str,
@@ -250,36 +304,62 @@ fn transform_chatgpt_responses_sse(
                         "model": "",
                         "stop_reason": null,
                         "stop_sequence": null,
-                        "usage": {
-                            "input_tokens": 0,
-                            "output_tokens": 0
-                        }
+                        "usage": { "input_tokens": 0, "output_tokens": 0 }
                     }
                 });
                 output.push_str(&format!("event: message_start\ndata: {}\n\n", message_start));
             }
         }
+
         "response.output_item.added" => {
-            // New output item - emit content_block_start for text
-            if !state.text_block_open {
-                state.text_block_open = true;
-                state.text_block_index = state.next_block_index;
-                state.next_block_index += 1;
-                let block_start = serde_json::json!({
-                    "type": "content_block_start",
-                    "index": state.text_block_index,
-                    "content_block": {
-                        "type": "text",
-                        "text": ""
+            // Inspect the item to determine its type (message vs function_call)
+            if let Some(ref item) = chunk.item {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match item_type {
+                    "function_call" => {
+                        // Open a tool_use content block
+                        let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let name    = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let output_index = chunk.output_index.unwrap_or(0);
+
+                        let block_index = state.next_block_index;
+                        state.tool_blocks.insert(output_index, block_index);
+                        state.next_block_index += 1;
+
+                        let block_start = serde_json::json!({
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": name,
+                                "input": {}
+                            }
+                        });
+                        output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
                     }
-                });
-                output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
+                    "message" => {
+                        // Open a text content block (only if not already open)
+                        if !state.text_block_open {
+                            state.text_block_open = true;
+                            state.text_block_index = state.next_block_index;
+                            state.next_block_index += 1;
+                            let block_start = serde_json::json!({
+                                "type": "content_block_start",
+                                "index": state.text_block_index,
+                                "content_block": { "type": "text", "text": "" }
+                            });
+                            output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
+
         "response.output_text.delta" => {
-            // Text content delta
             if let Some(ref text) = chunk.delta {
-                // Open text block if not already open
+                // Open text block if not already open (defensive)
                 if !state.text_block_open {
                     state.text_block_open = true;
                     state.text_block_index = state.next_block_index;
@@ -287,10 +367,7 @@ fn transform_chatgpt_responses_sse(
                     let block_start = serde_json::json!({
                         "type": "content_block_start",
                         "index": state.text_block_index,
-                        "content_block": {
-                            "type": "text",
-                            "text": ""
-                        }
+                        "content_block": { "type": "text", "text": "" }
                     });
                     output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
                 }
@@ -298,16 +375,46 @@ fn transform_chatgpt_responses_sse(
                 let delta = serde_json::json!({
                     "type": "content_block_delta",
                     "index": state.text_block_index,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": text
-                    }
+                    "delta": { "type": "text_delta", "text": text }
                 });
                 output.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
             }
         }
+
+        "response.function_call_arguments.delta" => {
+            if let Some(ref args_delta) = chunk.delta {
+                let output_index = chunk.output_index.unwrap_or(0);
+                if let Some(&block_index) = state.tool_blocks.get(&output_index) {
+                    let delta = serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": { "type": "input_json_delta", "partial_json": args_delta }
+                    });
+                    output.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
+                }
+            }
+        }
+
+        "response.output_item.done" => {
+            // Close the content block for this item
+            if let Some(ref item) = chunk.item {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if item_type == "function_call" {
+                    let output_index = chunk.output_index.unwrap_or(0);
+                    if let Some(&block_index) = state.tool_blocks.get(&output_index) {
+                        let block_stop = serde_json::json!({
+                            "type": "content_block_stop",
+                            "index": block_index
+                        });
+                        output.push_str(&format!("event: content_block_stop\ndata: {}\n\n", block_stop));
+                        state.had_tool_calls = true;
+                    }
+                }
+                // Text item.done is handled implicitly in response.completed
+            }
+        }
+
         "response.completed" => {
-            // Stream complete - emit termination sequence
             state.stream_ended = true;
 
             // Close text block if open
@@ -324,32 +431,26 @@ fn transform_chatgpt_responses_sse(
             let mut output_tokens = 0u32;
             if let Some(ref response) = chunk.response {
                 if let Some(usage) = response.get("usage") {
-                    input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    input_tokens  = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 }
             }
 
-            // Emit message_delta
+            // stop_reason: tool_use when tool calls were made, otherwise end_turn
+            let stop_reason = if state.had_tool_calls { "tool_use" } else { "end_turn" };
+
             let message_delta = serde_json::json!({
                 "type": "message_delta",
-                "delta": {
-                    "stop_reason": "end_turn",
-                    "stop_sequence": null
-                },
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens
-                }
+                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
             });
             output.push_str(&format!("event: message_delta\ndata: {}\n\n", message_delta));
 
-            // Emit message_stop
-            let message_stop = serde_json::json!({
-                "type": "message_stop"
-            });
+            let message_stop = serde_json::json!({ "type": "message_stop" });
             output.push_str(&format!("event: message_stop\ndata: {}\n\n", message_stop));
         }
-        // Ignore other event types (response.output_text.done, response.content_part.done, etc.)
+
+        // Silently ignore: response.content_part.added/done, response.output_text.done, etc.
         _ => {}
     }
 
@@ -467,46 +568,55 @@ impl OpenAIProvider {
         model.to_lowercase().contains("codex")
     }
 
-    /// Parse SSE (Server-Sent Events) response from ChatGPT Codex
+    /// Parse SSE (Server-Sent Events) response from ChatGPT Codex (non-streaming path).
+    ///
+    /// Reads the final `response.completed` event and converts the `output` array into
+    /// Anthropic ContentBlocks: text, reasoning (thinking), and function_call (tool_use).
     fn parse_sse_response(sse_text: &str) -> Result<Vec<ContentBlock>, ProviderError> {
-        // Find the response.completed event and extract both reasoning and message
         let lines: Vec<&str> = sse_text.lines().collect();
 
         for (i, line) in lines.iter().enumerate() {
             if line.starts_with("event: response.completed") {
-                // Next line should be data: {...}
                 if i + 1 < lines.len() {
                     let data_line = lines[i + 1];
                     if data_line.starts_with("data: ") {
-                        let json_str = &data_line[6..];  // Skip "data: "
+                        let json_str = &data_line[6..];
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            // Extract both reasoning and message from response.output array
-                            // Note: Codex models have reasoning at output[0], message at output[1]
                             if let Some(response) = json.get("response") {
                                 if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
                                     let mut content_blocks = Vec::new();
 
-                                    // Extract reasoning and message in order
                                     for output_item in output {
-                                        if let Some(output_type) = output_item.get("type").and_then(|v| v.as_str()) {
-                                            if let Some(content) = output_item.get("content").and_then(|v| v.as_array()) {
-                                                if let Some(first_content) = content.first() {
-                                                    if let Some(text) = first_content.get("text").and_then(|v| v.as_str()) {
-                                                        match output_type {
-                                                            "reasoning" => {
-                                                                // Unsigned thinking block (no signature field)
-                                                                content_blocks.push(ContentBlock::thinking(serde_json::json!({
-                                                                    "thinking": text
-                                                                })));
-                                                            }
-                                                            "message" => {
-                                                                content_blocks.push(ContentBlock::text(text.to_string(), None));
-                                                            }
-                                                            _ => {}
-                                                        }
+                                        let output_type = output_item.get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+
+                                        match output_type {
+                                            "reasoning" => {
+                                                if let Some(content) = output_item.get("content").and_then(|v| v.as_array()) {
+                                                    if let Some(text) = content.first().and_then(|c| c.get("text")).and_then(|v| v.as_str()) {
+                                                        content_blocks.push(ContentBlock::thinking(serde_json::json!({
+                                                            "thinking": text
+                                                        })));
                                                     }
                                                 }
                                             }
+                                            "message" => {
+                                                if let Some(content) = output_item.get("content").and_then(|v| v.as_array()) {
+                                                    if let Some(text) = content.first().and_then(|c| c.get("text")).and_then(|v| v.as_str()) {
+                                                        content_blocks.push(ContentBlock::text(text.to_string(), None));
+                                                    }
+                                                }
+                                            }
+                                            "function_call" => {
+                                                // Convert ChatGPT function_call → Anthropic tool_use
+                                                let call_id   = output_item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let name      = output_item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                                let arguments = output_item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                                                let input: serde_json::Value = serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+                                                content_blocks.push(ContentBlock::tool_use(call_id, name, input));
+                                            }
+                                            _ => {}
                                         }
                                     }
 
@@ -533,7 +643,7 @@ impl OpenAIProvider {
         let instructions = CODEX_INSTRUCTIONS.to_string();
 
         // Convert messages to Responses API input format
-        let mut messages = Vec::new();
+        let mut items: Vec<OpenAIResponsesItem> = Vec::new();
 
         // Add system message as a user message if present (Codex doesn't have separate system role)
         if let Some(ref system) = request.system {
@@ -547,42 +657,116 @@ impl OpenAIProvider {
                 }
             };
             // Prepend system message as user message
-            messages.push(OpenAIResponsesMessage {
+            items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
                 role: "user".to_string(),
                 content: Some(system_text),
-            });
+            }));
         }
 
-        // Transform messages
+        // Transform messages — Anthropic multi-turn with tool use becomes a flat item list
         for msg in &request.messages {
-            let content = match &msg.content {
-                MessageContent::Text(text) => text.clone(),
+            match &msg.content {
+                MessageContent::Text(text) => {
+                    items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
+                        role: msg.role.clone(),
+                        content: Some(text.clone()),
+                    }));
+                }
                 MessageContent::Blocks(blocks) => {
-                    let text = blocks.iter()
-                        .filter_map(|block| block.as_text().map(|s| s.to_string()))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    // Responses API requires content, use empty string if none
-                    if text.is_empty() {
-                        String::new()
-                    } else {
-                        text
+                    // Collect text and tool_use blocks for the assistant turn,
+                    // plus tool_result blocks which become function_call_output items.
+                    let mut text_parts: Vec<String> = Vec::new();
+
+                    for block in blocks {
+                        match block {
+                            ContentBlock::Known(KnownContentBlock::Text { text, .. }) => {
+                                text_parts.push(text.clone());
+                            }
+                            ContentBlock::Known(KnownContentBlock::ToolUse { id, name, input }) => {
+                                // Emit the text so far as an assistant message
+                                let combined = text_parts.join("\n");
+                                text_parts.clear();
+                                if !combined.is_empty() {
+                                    items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
+                                        role: "assistant".to_string(),
+                                        content: Some(combined),
+                                    }));
+                                }
+                                // Emit the function_call item (replaying what the model generated)
+                                items.push(OpenAIResponsesItem::FunctionCall(OpenAIResponsesFunctionCall {
+                                    r#type: "function_call".to_string(),
+                                    call_id: id.clone(),
+                                    name: name.clone(),
+                                    arguments: serde_json::to_string(input).unwrap_or_default(),
+                                }));
+                            }
+                            ContentBlock::Known(KnownContentBlock::ToolResult { tool_use_id, content, is_error, .. }) => {
+                                // Emit any pending text from this user turn first
+                                let combined = text_parts.join("\n");
+                                text_parts.clear();
+                                if !combined.is_empty() {
+                                    items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
+                                        role: msg.role.clone(),
+                                        content: Some(combined),
+                                    }));
+                                }
+                                // tool_use_id maps directly to call_id
+                                let output = if *is_error {
+                                    format!("[error] {}", content.to_string())
+                                } else {
+                                    content.to_string()
+                                };
+                                items.push(OpenAIResponsesItem::FunctionCallOutput(OpenAIResponsesFunctionCallOutput {
+                                    r#type: "function_call_output".to_string(),
+                                    call_id: tool_use_id.clone(),
+                                    output,
+                                }));
+                            }
+                            ContentBlock::Known(KnownContentBlock::Thinking { .. }) |
+                            ContentBlock::Known(KnownContentBlock::Image { .. }) |
+                            ContentBlock::Unknown(_) => {
+                                // Skip unsupported block types
+                            }
+                        }
+                    }
+
+                    // Flush any remaining text parts as a message
+                    let combined = text_parts.join("\n");
+                    if !combined.is_empty() {
+                        items.push(OpenAIResponsesItem::Message(OpenAIResponsesMessage {
+                            role: msg.role.clone(),
+                            content: Some(combined),
+                        }));
                     }
                 }
-            };
-
-            messages.push(OpenAIResponsesMessage {
-                role: msg.role.clone(),
-                content: Some(content),  // Always provide content
-            });
+            }
         }
+
+        // Convert Anthropic tool definitions to Responses API tool format
+        let tools = request.tools.as_ref().and_then(|anthropic_tools| {
+            if anthropic_tools.is_empty() {
+                None
+            } else {
+                Some(anthropic_tools.iter()
+                    .filter_map(|tool| {
+                        Some(OpenAIResponsesTool {
+                            r#type: "function".to_string(),
+                            name: tool.name.as_ref()?.clone(),
+                            description: tool.description.clone(),
+                            parameters: tool.input_schema.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>())
+            }
+        });
 
         Ok(OpenAIResponsesRequest {
             model: request.model.clone(),
-            input: OpenAIResponsesInput::Messages(messages),
+            input: OpenAIResponsesInput::Items(items),
             instructions,
             store: false,  // Required: ChatGPT backend requires store=false
             stream: true,  // Required: ChatGPT Codex requires stream=true
+            tools,
         })
     }
 
