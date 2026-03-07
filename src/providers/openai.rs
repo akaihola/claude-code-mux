@@ -568,6 +568,27 @@ impl OpenAIProvider {
         model.to_lowercase().contains("codex")
     }
 
+    /// Responses API support is narrower than the generic chat-completions path.
+    /// In particular, our current Responses API serializer is text/tool-only and
+    /// does not preserve image blocks, so OAuth requests with images must stay on
+    /// the chat-completions path until multimodal support is implemented there too.
+    fn request_can_use_responses_api(request: &AnthropicRequest) -> bool {
+        request.messages.iter().all(|msg| match &msg.content {
+            MessageContent::Text(_) => true,
+            MessageContent::Blocks(blocks) => blocks.iter().all(|block| {
+                !matches!(block, ContentBlock::Known(KnownContentBlock::Image { .. }))
+            }),
+        })
+    }
+
+    fn should_use_responses_api(&self, request: &AnthropicRequest) -> bool {
+        if self.is_oauth() {
+            Self::request_can_use_responses_api(request)
+        } else {
+            Self::is_codex_model(&request.model)
+        }
+    }
+
     /// Parse SSE (Server-Sent Events) response from ChatGPT Codex (non-streaming path).
     ///
     /// Reads the final `response.completed` event and converts the `output` array into
@@ -1561,14 +1582,10 @@ impl AnthropicProvider for OpenAIProvider {
             &self.base_url
         };
 
-        // Check if we should use Responses API endpoint:
-        // - OAuth: Always use /codex/responses for all models
-        // - API Key: Only use /responses for models containing "codex"
-        let use_responses_api = if self.is_oauth() {
-            true  // OAuth always uses Codex endpoint
-        } else {
-            Self::is_codex_model(&request.model)  // API Key only for codex models
-        };
+        // Check if we should use Responses API endpoint.
+        // OAuth requests only use the ChatGPT responses path when the request stays
+        // within the subset our serializer can preserve losslessly.
+        let use_responses_api = self.should_use_responses_api(&request);
 
         if use_responses_api {
             // Use /v1/responses endpoint for Codex models
@@ -1788,14 +1805,10 @@ impl AnthropicProvider for OpenAIProvider {
             &self.base_url
         };
 
-        // Check if we should use Responses API endpoint:
-        // - OAuth: Always use /codex/responses for all models (ChatGPT backend doesn't have /chat/completions)
-        // - API Key: Only use /responses for models containing "codex"
-        let use_responses_api = if self.is_oauth() {
-            true  // OAuth always uses Codex endpoint
-        } else {
-            Self::is_codex_model(&request.model)  // API Key only for codex models
-        };
+        // Check if we should use Responses API endpoint.
+        // OAuth requests only use the ChatGPT responses path when the request stays
+        // within the subset our serializer can preserve losslessly.
+        let use_responses_api = self.should_use_responses_api(&request);
 
         let (url, request_body) = if use_responses_api {
             // Use /v1/responses endpoint for Codex models
@@ -2222,5 +2235,93 @@ mod tests {
         assert!(out.contains("thinking about it"), "should include reasoning content");
         assert!(out.contains("\"type\":\"thinking\""), "should be a thinking content block");
         assert!(out.contains("thinking_delta"), "should use thinking_delta type");
+    }
+
+    #[test]
+    fn test_chatgpt_responses_tool_call_stream_maps_to_tool_use() {
+        let mut state = StreamTransformState::default();
+        let id = "msg_test";
+
+        let created = ChatGptResponsesChunk {
+            chunk_type: "response.created".to_string(),
+            delta: None,
+            content_index: None,
+            item_id: None,
+            output_index: None,
+            item: None,
+            response: None,
+        };
+        let out = transform_chatgpt_responses_sse(&created, id, &mut state);
+        assert!(out.contains("message_start"));
+
+        let tool_added: ChatGptResponsesChunk = serde_json::from_str(r#"{
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","call_id":"call_123","name":"bash","arguments":""}
+        }"#).unwrap();
+        let out = transform_chatgpt_responses_sse(&tool_added, id, &mut state);
+        assert!(out.contains("content_block_start"));
+        assert!(out.contains("tool_use"));
+        assert!(out.contains(r#""name":"bash""#));
+
+        let tool_delta: ChatGptResponsesChunk = serde_json::from_str(r#"{
+            "type":"response.function_call_arguments.delta",
+            "output_index":0,
+            "delta":"{\"command\":\"echo hi\"}"
+        }"#).unwrap();
+        let out = transform_chatgpt_responses_sse(&tool_delta, id, &mut state);
+        assert!(out.contains("input_json_delta"));
+        assert!(out.contains("echo hi"));
+
+        let tool_done: ChatGptResponsesChunk = serde_json::from_str(r#"{
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":{"type":"function_call","call_id":"call_123","name":"bash","arguments":"{\"command\":\"echo hi\"}"}
+        }"#).unwrap();
+        let out = transform_chatgpt_responses_sse(&tool_done, id, &mut state);
+        assert!(out.contains("content_block_stop"));
+
+        let completed: ChatGptResponsesChunk = serde_json::from_str(r#"{
+            "type":"response.completed",
+            "response":{"usage":{"input_tokens":12,"output_tokens":3}}
+        }"#).unwrap();
+        let out = transform_chatgpt_responses_sse(&completed, id, &mut state);
+        assert!(out.contains(r#""stop_reason":"tool_use""#));
+        assert!(out.contains("message_stop"));
+    }
+
+    #[test]
+    fn test_parse_chatgpt_responses_non_streaming_function_call() {
+        let sse = r#"event: response.completed
+ data: {"response":{"output":[{"type":"function_call","call_id":"call_abc","name":"bash","arguments":"{\"command\":\"echo hi\"}"}],"usage":{"input_tokens":7,"output_tokens":2}}}
+
+"#;
+        let blocks = OpenAIProvider::parse_sse_response(&sse.replace("\n data:", "\ndata:" )).unwrap();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Known(KnownContentBlock::ToolUse { id, name, input }) => {
+                assert_eq!(id, "call_abc");
+                assert_eq!(name, "bash");
+                assert_eq!(input.get("command").and_then(|v| v.as_str()), Some("echo hi"));
+            }
+            other => panic!("expected tool_use block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_oauth_image_requests_do_not_use_responses_api() {
+        let request: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/cat.png"}}
+                ]
+            }]
+        })).unwrap();
+
+        assert!(!OpenAIProvider::request_can_use_responses_api(&request));
     }
 }
