@@ -1636,17 +1636,22 @@ impl AnthropicProvider for OpenAIProvider {
 
             // Parse SSE (Server-Sent Events) format
             // Format: event: xxx\ndata: {...}\n\n
-            // This extracts both reasoning (converted to thinking) and message blocks
+            // This extracts reasoning (thinking), text, and function_call (tool_use) blocks
             let content_blocks = Self::parse_sse_response(&response_text)?;
 
-            // Return direct response (SSE doesn't need transform)
+            // stop_reason: "tool_use" if any tool_use block is present, else "end_turn"
+            let has_tool_calls = content_blocks.iter().any(|b| {
+                matches!(b, ContentBlock::Known(KnownContentBlock::ToolUse { .. }))
+            });
+            let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
+
             Ok(ProviderResponse {
                 id: "sse-response".to_string(),
                 r#type: "message".to_string(),
                 role: "assistant".to_string(),
                 content: content_blocks,
                 model: request.model.clone(),
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(stop_reason.to_string()),
                 stop_sequence: None,
                 usage: Usage {
                     input_tokens: 0,  // SSE doesn't provide token counts
