@@ -63,9 +63,30 @@ struct OpenAIResponsesRequest {
     store: bool,
     /// Enable streaming responses
     stream: bool,
+    /// Reasoning controls for Responses API models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAIResponsesReasoning>,
     /// Tool definitions (function calling support)
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIResponsesReasoning {
+    effort: String,
+    summary: String,
+}
+
+fn map_budget_tokens_to_reasoning_effort(budget_tokens: Option<u32>) -> Option<&'static str> {
+    match budget_tokens {
+        None => Some("medium"),
+        Some(0) => None,
+        Some(tokens) if tokens <= 1_024 => Some("minimal"),
+        Some(tokens) if tokens <= 4_096 => Some("low"),
+        Some(tokens) if tokens <= 12_288 => Some("medium"),
+        Some(tokens) if tokens <= 24_576 => Some("high"),
+        Some(_) => Some("xhigh"),
+    }
 }
 
 /// Content can be string or array of content parts
@@ -604,12 +625,23 @@ impl OpenAIProvider {
             }).collect::<Vec<_>>()
         });
 
+        let reasoning = request.thinking.as_ref().and_then(|thinking| {
+            if thinking.r#type != "enabled" {
+                return None;
+            }
+            map_budget_tokens_to_reasoning_effort(thinking.budget_tokens).map(|effort| OpenAIResponsesReasoning {
+                effort: effort.to_string(),
+                summary: "auto".to_string(),
+            })
+        });
+
         Ok(OpenAIResponsesRequest {
             model: request.model.clone(),
             input: items,
             instructions: CODEX_INSTRUCTIONS.to_string(),
             store: false,  // ChatGPT backend requires store=false
             stream: true,  // ChatGPT Codex requires stream=true
+            reasoning,
             tools,
         })
     }
@@ -2125,5 +2157,29 @@ mod tests {
         // The image block should be dropped; only the text item should appear
         assert_eq!(responses_req.input.len(), 1);
         assert_eq!(responses_req.input[0]["content"], "describe this");
+    }
+
+    #[test]
+    fn test_responses_request_maps_anthropic_thinking_budget_to_openai_reasoning() {
+        let provider = OpenAIProvider::with_headers(
+            "test".to_string(),
+            "key".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let request: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 128,
+            "thinking": {"type": "enabled", "budget_tokens": 24576},
+            "messages": [{"role": "user", "content": "think hard"}]
+        })).unwrap();
+
+        let responses_req = provider.transform_to_responses_request(&request).unwrap();
+        let reasoning = responses_req.reasoning.expect("reasoning should be forwarded");
+        assert_eq!(reasoning.effort, "high");
+        assert_eq!(reasoning.summary, "auto");
     }
 }
