@@ -104,24 +104,22 @@ impl Router {
             .router
             .prompt_rules
             .iter()
-            .filter_map(|rule| {
-                match Regex::new(&rule.pattern) {
-                    Ok(regex) => {
-                        let is_dynamic = contains_capture_reference(&rule.model);
-                        Some(CompiledPromptRule {
-                            regex,
-                            model: rule.model.clone(),
-                            strip_match: rule.strip_match,
-                            is_dynamic,
-                        })
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Invalid prompt_rule pattern '{}': {}. Skipping.",
-                            rule.pattern, e
-                        );
-                        None
-                    }
+            .filter_map(|rule| match Regex::new(&rule.pattern) {
+                Ok(regex) => {
+                    let is_dynamic = contains_capture_reference(&rule.model);
+                    Some(CompiledPromptRule {
+                        regex,
+                        model: rule.model.clone(),
+                        strip_match: rule.strip_match,
+                        is_dynamic,
+                    })
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Invalid prompt_rule pattern '{}': {}. Skipping.",
+                        rule.pattern, e
+                    );
+                    None
                 }
             })
             .collect();
@@ -212,7 +210,13 @@ impl Router {
 
         // 5. Think mode (Plan Mode / Reasoning)
         if let Some(ref think_model) = self.config.router.think {
-            if self.is_plan_mode(request) {
+            let exempt = self
+                .config
+                .router
+                .think_exempt_models
+                .iter()
+                .any(|m| m == &request.model);
+            if !exempt && self.is_plan_mode(request) {
                 debug!("🧠 Routing to think model (Plan Mode detected)");
                 return Ok(RouteDecision {
                     model_name: think_model.clone(),
@@ -285,7 +289,11 @@ impl Router {
                 let content_desc = match &msg.content {
                     MessageContent::Text(t) => {
                         let preview: String = t.chars().take(60).collect();
-                        format!("Text({:?}{})", preview, if t.len() > 60 { "..." } else { "" })
+                        format!(
+                            "Text({:?}{})",
+                            preview,
+                            if t.len() > 60 { "..." } else { "" }
+                        )
                     }
                     MessageContent::Blocks(blocks) => {
                         let types: Vec<&str> = blocks
@@ -295,7 +303,9 @@ impl Router {
                                     crate::models::KnownContentBlock::Text { .. } => "text",
                                     crate::models::KnownContentBlock::Image { .. } => "image",
                                     crate::models::KnownContentBlock::ToolUse { .. } => "tool_use",
-                                    crate::models::KnownContentBlock::ToolResult { .. } => "tool_result",
+                                    crate::models::KnownContentBlock::ToolResult { .. } => {
+                                        "tool_result"
+                                    }
                                     crate::models::KnownContentBlock::Thinking { .. } => "thinking",
                                 },
                                 ContentBlock::Unknown(_) => "unknown",
@@ -304,10 +314,7 @@ impl Router {
                         format!("Blocks({:?})", types)
                     }
                 };
-                debug!(
-                    "🔍 msg[{}] role={}: {}",
-                    idx, msg.role, content_desc
-                );
+                debug!("🔍 msg[{}] role={}: {}", idx, msg.role, content_desc);
             }
         }
 
@@ -359,11 +366,7 @@ impl Router {
     /// Extract the text content from the last user message
     fn extract_last_user_message(&self, request: &AnthropicRequest) -> Option<String> {
         // Find the last user message
-        let last_user = request
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")?;
+        let last_user = request.messages.iter().rev().find(|m| m.role == "user")?;
 
         // Extract text content (excluding system-reminder blocks)
         match &last_user.content {
@@ -429,7 +432,10 @@ impl Router {
                 if !has_tool_use {
                     // This assistant message ends the previous turn
                     // Current turn starts after this message
-                    debug!("🔍 Turn starts at idx={} (after assistant without tool_use)", idx + 1);
+                    debug!(
+                        "🔍 Turn starts at idx={} (after assistant without tool_use)",
+                        idx + 1
+                    );
                     return idx + 1;
                 }
             }
@@ -491,7 +497,11 @@ impl Router {
     }
 
     /// Strip the matched phrase from the turn-starting user message
-    fn strip_match_from_turn_starting_message(&self, request: &mut AnthropicRequest, regex: &Regex) {
+    fn strip_match_from_turn_starting_message(
+        &self,
+        request: &mut AnthropicRequest,
+        regex: &Regex,
+    ) {
         let turn_start_idx = self.find_turn_start_index(request);
 
         // Find the first user message with text content from turn_start_idx onwards
@@ -607,7 +617,12 @@ impl Router {
                     second_block.text = re.replace_all(&second_block.text, "").to_string();
 
                     // First, try to find a model with this name in the models config (case-insensitive)
-                    if let Some(_model) = self.config.models.iter().find(|m| m.name.eq_ignore_ascii_case(&tag_value)) {
+                    if let Some(_model) = self
+                        .config
+                        .models
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(&tag_value))
+                    {
                         // Found a configured model with this name (use the configured case)
                         return Some(_model.name.clone());
                     }
@@ -642,6 +657,7 @@ mod tests {
                 auto_map_regex: None,   // Use default Claude pattern
                 background_regex: None, // Use default claude-haiku pattern
                 prompt_rules: vec![],   // No prompt rules by default
+                think_exempt_models: vec![],
             },
             providers: vec![],
             models: vec![],
@@ -997,25 +1013,25 @@ mod tests {
                 // Assistant response with tool_use
                 Message {
                     role: "assistant".to_string(),
-                    content: MessageContent::Blocks(vec![
-                        ContentBlock::Known(KnownContentBlock::ToolUse {
+                    content: MessageContent::Blocks(vec![ContentBlock::Known(
+                        KnownContentBlock::ToolUse {
                             id: "tool_1".to_string(),
                             name: "Read".to_string(),
                             input: serde_json::json!({"file_path": "/src/main.rs"}),
-                        }),
-                    ]),
+                        },
+                    )]),
                 },
                 // User message with only tool_result (no text)
                 Message {
                     role: "user".to_string(),
-                    content: MessageContent::Blocks(vec![
-                        ContentBlock::Known(KnownContentBlock::ToolResult {
+                    content: MessageContent::Blocks(vec![ContentBlock::Known(
+                        KnownContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
                             content: ToolResultContent::Text("fn main() {}".to_string()),
                             is_error: false,
                             cache_control: None,
-                        }),
-                    ]),
+                        },
+                    )]),
                 },
             ],
             max_tokens: 1024,
@@ -1116,25 +1132,25 @@ mod tests {
                 // Assistant with tool_use
                 Message {
                     role: "assistant".to_string(),
-                    content: MessageContent::Blocks(vec![
-                        ContentBlock::Known(KnownContentBlock::ToolUse {
+                    content: MessageContent::Blocks(vec![ContentBlock::Known(
+                        KnownContentBlock::ToolUse {
                             id: "tool_1".to_string(),
                             name: "Read".to_string(),
                             input: serde_json::json!({}),
-                        }),
-                    ]),
+                        },
+                    )]),
                 },
                 // User with tool_result
                 Message {
                     role: "user".to_string(),
-                    content: MessageContent::Blocks(vec![
-                        ContentBlock::Known(KnownContentBlock::ToolResult {
+                    content: MessageContent::Blocks(vec![ContentBlock::Known(
+                        KnownContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
                             content: ToolResultContent::Text("content".to_string()),
                             is_error: false,
                             cache_control: None,
-                        }),
-                    ]),
+                        },
+                    )]),
                 },
             ],
             max_tokens: 1024,

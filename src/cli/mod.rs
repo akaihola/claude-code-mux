@@ -1,7 +1,7 @@
+use crate::providers::ProviderConfig;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use anyhow::{Context, Result};
-use crate::providers::ProviderConfig;
 
 /// Application configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +128,10 @@ pub struct RouterConfig {
     /// Prompt-based routing rules. Routes to specific models when patterns match user prompt.
     #[serde(default)]
     pub prompt_rules: Vec<PromptRule>,
+    /// Models exempt from think routing. Requests for these models with thinking enabled
+    /// are NOT rerouted to the think model — they proceed to their own provider instead.
+    #[serde(default)]
+    pub think_exempt_models: Vec<String>,
 }
 
 /// Prompt-based routing rule
@@ -173,11 +177,14 @@ impl AppConfig {
     /// Get default config file path
     /// Returns ~/.claude-code-mux/config.toml (cross-platform)
     pub fn default_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .context("Failed to get home directory")?;
+        let home = dirs::home_dir().context("Failed to get home directory")?;
         let config_dir = home.join(".claude-code-mux");
-        std::fs::create_dir_all(&config_dir)
-            .with_context(|| format!("Failed to create config directory: {}", config_dir.display()))?;
+        std::fs::create_dir_all(&config_dir).with_context(|| {
+            format!(
+                "Failed to create config directory: {}",
+                config_dir.display()
+            )
+        })?;
         Ok(config_dir.join("config.toml"))
     }
 
@@ -204,20 +211,28 @@ impl AppConfig {
     fn create_default_config(path: &PathBuf) -> Result<()> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
 
         // Check for existing config in old location (config/default.toml)
         let old_config_path = PathBuf::from("config/default.toml");
         if old_config_path.exists() {
             // Migrate existing config
-            eprintln!("📦 Migrating existing config from {} to {}",
-                old_config_path.display(), path.display());
+            eprintln!(
+                "📦 Migrating existing config from {} to {}",
+                old_config_path.display(),
+                path.display()
+            );
 
-            std::fs::copy(&old_config_path, path)
-                .with_context(|| format!("Failed to migrate config from {} to {}",
-                    old_config_path.display(), path.display()))?;
+            std::fs::copy(&old_config_path, path).with_context(|| {
+                format!(
+                    "Failed to migrate config from {} to {}",
+                    old_config_path.display(),
+                    path.display()
+                )
+            })?;
 
             eprintln!("✅ Migration complete! Your existing configuration has been preserved.");
             eprintln!("   Old location: {}", old_config_path.display());
@@ -230,8 +245,9 @@ impl AppConfig {
             let default_config = Self::default_config_content();
 
             // Write to file
-            std::fs::write(path, default_config)
-                .with_context(|| format!("Failed to write default config file: {}", path.display()))?;
+            std::fs::write(path, default_config).with_context(|| {
+                format!("Failed to write default config file: {}", path.display())
+            })?;
 
             eprintln!("Created default config file at: {}", path.display());
             eprintln!("Please edit the config file to add your providers and models.");
@@ -312,7 +328,8 @@ default = "placeholder-model"
 # provider = "my-provider"
 # actual_model = "claude-sonnet-4-5"
 # priority = 1
-"#.to_string()
+"#
+        .to_string()
     }
 
     /// Resolve environment variables in configuration
@@ -339,7 +356,11 @@ default = "placeholder-model"
                     if let Ok(value) = std::env::var(env_var) {
                         provider.api_key = Some(value);
                     } else {
-                        anyhow::bail!("Environment variable {} not found for provider {}", env_var, provider.name);
+                        anyhow::bail!(
+                            "Environment variable {} not found for provider {}",
+                            env_var,
+                            provider.name
+                        );
                     }
                 }
             }
