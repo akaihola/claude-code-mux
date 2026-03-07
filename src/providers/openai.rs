@@ -198,32 +198,7 @@ struct ResponsesUsage {
     output_tokens: u32,
 }
 
-/// ChatGPT /codex/responses API streaming chunk
-/// This is a different format from standard OpenAI streaming
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ChatGptResponsesChunk {
-    #[serde(rename = "type")]
-    chunk_type: String,
-    // For response.output_text.delta and response.function_call_arguments.delta
-    #[serde(default)]
-    delta: Option<String>,
-    #[serde(default)]
-    content_index: Option<u32>,
-    // item_id is the id of the output item (message or function_call)
-    #[serde(default)]
-    item_id: Option<String>,
-    #[serde(default)]
-    output_index: Option<u32>,
-    // For response.output_item.added and response.output_item.done
-    #[serde(default)]
-    item: Option<serde_json::Value>,
-    // For response.completed
-    #[serde(default)]
-    response: Option<serde_json::Value>,
-}
-
-/// Transform ChatGPT /codex/responses SSE format to Anthropic SSE format.
+/// Transform a ChatGPT /codex/responses SSE event (parsed as JSON) into Anthropic SSE bytes.
 ///
 /// ChatGPT event types handled:
 /// - response.created / response.in_progress       → message_start
@@ -234,74 +209,50 @@ struct ChatGptResponsesChunk {
 /// - response.output_item.done (function_call)     → content_block_stop + had_tool_calls=true
 /// - response.completed                            → content_block_stop + message_delta + message_stop
 fn transform_chatgpt_responses_sse(
-    chunk: &ChatGptResponsesChunk,
+    chunk: &serde_json::Value,
     message_id: &str,
     state: &mut StreamTransformState,
 ) -> String {
     let mut output = String::new();
+    let output_index = || chunk.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    match chunk.chunk_type.as_str() {
+    match chunk["type"].as_str().unwrap_or("") {
         "response.created" | "response.in_progress" => {
-            // First event: emit message_start
             if !state.message_started {
                 state.message_started = true;
-                let message_start = serde_json::json!({
+                let msg = serde_json::json!({
                     "type": "message_start",
                     "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": "",
-                        "stop_reason": null,
-                        "stop_sequence": null,
-                        "usage": { "input_tokens": 0, "output_tokens": 0 }
+                        "id": message_id, "type": "message", "role": "assistant",
+                        "content": [], "model": "", "stop_reason": null,
+                        "stop_sequence": null, "usage": { "input_tokens": 0, "output_tokens": 0 }
                     }
                 });
-                output.push_str(&format!("event: message_start\ndata: {}\n\n", message_start));
+                output.push_str(&format!("event: message_start\ndata: {}\n\n", msg));
             }
         }
 
         "response.output_item.added" => {
-            // Inspect the item to determine its type (message vs function_call)
-            if let Some(ref item) = chunk.item {
-                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match item_type {
+            if let Some(item) = chunk.get("item") {
+                match item["type"].as_str().unwrap_or("") {
                     "function_call" => {
-                        // Open a tool_use content block
-                        let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let name    = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let output_index = chunk.output_index.unwrap_or(0);
-
-                        let block_index = state.next_block_index;
-                        state.tool_blocks.insert(output_index, block_index);
+                        let call_id = item["call_id"].as_str().unwrap_or("");
+                        let name    = item["name"].as_str().unwrap_or("unknown");
+                        let idx = output_index();
+                        let block = state.next_block_index;
+                        state.tool_blocks.insert(idx, block);
                         state.next_block_index += 1;
-
-                        let block_start = serde_json::json!({
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": call_id,
-                                "name": name,
-                                "input": {}
-                            }
-                        });
-                        output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
+                        output.push_str(&format!("event: content_block_start\ndata: {}\n\n",
+                            serde_json::json!({"type":"content_block_start","index":block,
+                                "content_block":{"type":"tool_use","id":call_id,"name":name,"input":{}}})));
                     }
-                    "message" => {
-                        // Open a text content block (only if not already open)
-                        if !state.text_block_open {
-                            state.text_block_open = true;
-                            state.text_block_index = state.next_block_index;
-                            state.next_block_index += 1;
-                            let block_start = serde_json::json!({
-                                "type": "content_block_start",
-                                "index": state.text_block_index,
-                                "content_block": { "type": "text", "text": "" }
-                            });
-                            output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
-                        }
+                    "message" if !state.text_block_open => {
+                        state.text_block_open = true;
+                        state.text_block_index = state.next_block_index;
+                        state.next_block_index += 1;
+                        output.push_str(&format!("event: content_block_start\ndata: {}\n\n",
+                            serde_json::json!({"type":"content_block_start","index":state.text_block_index,
+                                "content_block":{"type":"text","text":""}})));
                     }
                     _ => {}
                 }
@@ -309,100 +260,63 @@ fn transform_chatgpt_responses_sse(
         }
 
         "response.output_text.delta" => {
-            if let Some(ref text) = chunk.delta {
-                // Open text block if not already open (defensive)
+            if let Some(text) = chunk["delta"].as_str() {
                 if !state.text_block_open {
                     state.text_block_open = true;
                     state.text_block_index = state.next_block_index;
                     state.next_block_index += 1;
-                    let block_start = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": state.text_block_index,
-                        "content_block": { "type": "text", "text": "" }
-                    });
-                    output.push_str(&format!("event: content_block_start\ndata: {}\n\n", block_start));
+                    output.push_str(&format!("event: content_block_start\ndata: {}\n\n",
+                        serde_json::json!({"type":"content_block_start","index":state.text_block_index,
+                            "content_block":{"type":"text","text":""}})));
                 }
-
-                let delta = serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": state.text_block_index,
-                    "delta": { "type": "text_delta", "text": text }
-                });
-                output.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
+                output.push_str(&format!("event: content_block_delta\ndata: {}\n\n",
+                    serde_json::json!({"type":"content_block_delta","index":state.text_block_index,
+                        "delta":{"type":"text_delta","text":text}})));
             }
         }
 
         "response.function_call_arguments.delta" => {
-            if let Some(ref args_delta) = chunk.delta {
-                let output_index = chunk.output_index.unwrap_or(0);
-                if let Some(&block_index) = state.tool_blocks.get(&output_index) {
-                    let delta = serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": { "type": "input_json_delta", "partial_json": args_delta }
-                    });
-                    output.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
+            if let Some(args) = chunk["delta"].as_str() {
+                let idx = output_index();
+                if let Some(&block) = state.tool_blocks.get(&idx) {
+                    output.push_str(&format!("event: content_block_delta\ndata: {}\n\n",
+                        serde_json::json!({"type":"content_block_delta","index":block,
+                            "delta":{"type":"input_json_delta","partial_json":args}})));
                 }
             }
         }
 
         "response.output_item.done" => {
-            // Close the content block for this item
-            if let Some(ref item) = chunk.item {
-                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if item_type == "function_call" {
-                    let output_index = chunk.output_index.unwrap_or(0);
-                    if let Some(&block_index) = state.tool_blocks.get(&output_index) {
-                        let block_stop = serde_json::json!({
-                            "type": "content_block_stop",
-                            "index": block_index
-                        });
-                        output.push_str(&format!("event: content_block_stop\ndata: {}\n\n", block_stop));
+            if let Some(item) = chunk.get("item") {
+                if item["type"].as_str() == Some("function_call") {
+                    let idx = output_index();
+                    if let Some(&block) = state.tool_blocks.get(&idx) {
+                        output.push_str(&format!("event: content_block_stop\ndata: {}\n\n",
+                            serde_json::json!({"type":"content_block_stop","index":block})));
                         state.had_tool_calls = true;
                     }
                 }
-                // Text item.done is handled implicitly in response.completed
             }
         }
 
         "response.completed" => {
             state.stream_ended = true;
-
-            // Close text block if open
             if state.text_block_open {
-                let block_stop = serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": state.text_block_index
-                });
-                output.push_str(&format!("event: content_block_stop\ndata: {}\n\n", block_stop));
+                output.push_str(&format!("event: content_block_stop\ndata: {}\n\n",
+                    serde_json::json!({"type":"content_block_stop","index":state.text_block_index})));
             }
-
-            // Extract usage from response.completed
-            let mut input_tokens = 0u32;
-            let mut output_tokens = 0u32;
-            if let Some(ref response) = chunk.response {
-                if let Some(usage) = response.get("usage") {
-                    input_tokens  = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                }
-            }
-
-            // stop_reason: tool_use when tool calls were made, otherwise end_turn
+            let usage = chunk.get("response").and_then(|r| r.get("usage"));
+            let input_tokens  = usage.and_then(|u| u["input_tokens"].as_u64()).unwrap_or(0) as u32;
+            let output_tokens = usage.and_then(|u| u["output_tokens"].as_u64()).unwrap_or(0) as u32;
             let stop_reason = if state.had_tool_calls { "tool_use" } else { "end_turn" };
-
-            let message_delta = serde_json::json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
-            });
-            output.push_str(&format!("event: message_delta\ndata: {}\n\n", message_delta));
-
-            let message_stop = serde_json::json!({ "type": "message_stop" });
-            output.push_str(&format!("event: message_stop\ndata: {}\n\n", message_stop));
+            output.push_str(&format!("event: message_delta\ndata: {}\n\n",
+                serde_json::json!({"type":"message_delta",
+                    "delta":{"stop_reason":stop_reason,"stop_sequence":null},
+                    "usage":{"input_tokens":input_tokens,"output_tokens":output_tokens}})));
+            output.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
         }
 
-        // Silently ignore: response.content_part.added/done, response.output_text.done, etc.
-        _ => {}
+        _ => {} // Silently ignore other events (response.content_part.*, response.output_text.done, …)
     }
 
     output
@@ -1862,35 +1776,14 @@ impl AnthropicProvider for OpenAIProvider {
 
                         // Use ChatGPT format for OAuth + responses API, standard OpenAI format otherwise
                         if use_chatgpt_format {
-                            // Parse ChatGPT /codex/responses format
-                            match serde_json::from_str::<ChatGptResponsesChunk>(&sse_event.data) {
-                                Ok(chunk) => {
-                                    tracing::debug!("✨ Transforming ChatGPT responses chunk: {}", chunk.chunk_type);
-
-                                    // Transform to Anthropic format (raw SSE bytes)
-                                    let sse_output = transform_chatgpt_responses_sse(
-                                        &chunk,
-                                        &message_id,
-                                        &mut *state.lock().unwrap()
-                                    );
-
-                                    if !sse_output.is_empty() {
-                                        tracing::debug!("SSE: {} bytes", sse_output.len());
-                                    } else {
-                                        tracing::debug!("SSE: empty output (will be filtered)");
-                                    }
-
-                                    // Return as raw bytes (already SSE-formatted)
-                                    Ok(Bytes::from(sse_output))
-                                }
-                                Err(e) => {
-                                    // Silently skip unknown event types from ChatGPT
-                                    tracing::debug!(
-                                        "⏭️ Skipping unparseable ChatGPT chunk: {} - Data: {}",
-                                        e, &sse_event.data[..sse_event.data.len().min(200)]
-                                    );
-                                    Ok(Bytes::new())
-                                }
+                            // Parse as generic JSON — ChatGPT event types are handled in the transformer
+                            if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&sse_event.data) {
+                                tracing::debug!("✨ ChatGPT chunk: {}", chunk["type"].as_str().unwrap_or("?"));
+                                let sse_output = transform_chatgpt_responses_sse(
+                                    &chunk, &message_id, &mut *state.lock().unwrap());
+                                Ok(Bytes::from(sse_output))
+                            } else {
+                                Ok(Bytes::new())
                             }
                         } else {
                             // Parse standard OpenAI chunk
@@ -2151,50 +2044,36 @@ mod tests {
         let mut state = StreamTransformState::default();
         let id = "msg_test";
 
-        let created = ChatGptResponsesChunk {
-            chunk_type: "response.created".to_string(),
-            delta: None,
-            content_index: None,
-            item_id: None,
-            output_index: None,
-            item: None,
-            response: None,
-        };
-        let out = transform_chatgpt_responses_sse(&created, id, &mut state);
+        let chunk = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+
+        let out = transform_chatgpt_responses_sse(&chunk(r#"{"type":"response.created"}"#), id, &mut state);
         assert!(out.contains("message_start"));
 
-        let tool_added: ChatGptResponsesChunk = serde_json::from_str(r#"{
-            "type":"response.output_item.added",
-            "output_index":0,
+        let out = transform_chatgpt_responses_sse(&chunk(r#"{
+            "type":"response.output_item.added","output_index":0,
             "item":{"type":"function_call","call_id":"call_123","name":"bash","arguments":""}
-        }"#).unwrap();
-        let out = transform_chatgpt_responses_sse(&tool_added, id, &mut state);
+        }"#), id, &mut state);
         assert!(out.contains("content_block_start"));
         assert!(out.contains("tool_use"));
         assert!(out.contains(r#""name":"bash""#));
 
-        let tool_delta: ChatGptResponsesChunk = serde_json::from_str(r#"{
-            "type":"response.function_call_arguments.delta",
-            "output_index":0,
+        let out = transform_chatgpt_responses_sse(&chunk(r#"{
+            "type":"response.function_call_arguments.delta","output_index":0,
             "delta":"{\"command\":\"echo hi\"}"
-        }"#).unwrap();
-        let out = transform_chatgpt_responses_sse(&tool_delta, id, &mut state);
+        }"#), id, &mut state);
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("echo hi"));
 
-        let tool_done: ChatGptResponsesChunk = serde_json::from_str(r#"{
-            "type":"response.output_item.done",
-            "output_index":0,
-            "item":{"type":"function_call","call_id":"call_123","name":"bash","arguments":"{\"command\":\"echo hi\"}"}
-        }"#).unwrap();
-        let out = transform_chatgpt_responses_sse(&tool_done, id, &mut state);
+        let out = transform_chatgpt_responses_sse(&chunk(r#"{
+            "type":"response.output_item.done","output_index":0,
+            "item":{"type":"function_call","call_id":"call_123","name":"bash","arguments":"{}"}
+        }"#), id, &mut state);
         assert!(out.contains("content_block_stop"));
 
-        let completed: ChatGptResponsesChunk = serde_json::from_str(r#"{
+        let out = transform_chatgpt_responses_sse(&chunk(r#"{
             "type":"response.completed",
             "response":{"usage":{"input_tokens":12,"output_tokens":3}}
-        }"#).unwrap();
-        let out = transform_chatgpt_responses_sse(&completed, id, &mut state);
+        }"#), id, &mut state);
         assert!(out.contains(r#""stop_reason":"tool_use""#));
         assert!(out.contains("message_stop"));
     }
