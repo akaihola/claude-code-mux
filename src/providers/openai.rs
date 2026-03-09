@@ -1669,6 +1669,21 @@ impl AnthropicProvider for OpenAIProvider {
             // Use /v1/responses endpoint for Codex models
             tracing::debug!("Using /v1/responses endpoint (streaming): {}", request.model);
             let responses_request = self.transform_to_responses_request(&request)?;
+            tracing::info!(
+                "🧠 Responses reasoning for {} via {}: effort={}, summary={}",
+                request.model,
+                self.name,
+                responses_request
+                    .reasoning
+                    .as_ref()
+                    .map(|r| r.effort.as_str())
+                    .unwrap_or("off"),
+                responses_request
+                    .reasoning
+                    .as_ref()
+                    .map(|r| r.summary.as_str())
+                    .unwrap_or("off")
+            );
             let body = serde_json::to_value(&responses_request)
                 .map_err(|e| ProviderError::SerializationError(e))?;
 
