@@ -235,36 +235,54 @@ impl AnthropicCompatibleProvider {
         }
     }
 
-    /// Get authentication header value (API key or OAuth Bearer token)
+    /// Get authentication header value (API key or OAuth Bearer token).
+    ///
+    /// Token refresh is protected by a per-provider async mutex to prevent the
+    /// "thundering herd" race where multiple concurrent requests all detect
+    /// `needs_refresh() == true`, simultaneously send a refresh request, and all
+    /// but one receive `invalid_grant` because Anthropic rotates refresh tokens
+    /// on use.  After acquiring the lock we re-check whether the token still
+    /// needs refreshing – if another task already refreshed it while we waited,
+    /// we just use the fresh token directly.
     async fn get_auth_header(&self) -> Result<String, ProviderError> {
         // If OAuth provider is configured, use Bearer token
         if let Some(ref oauth_provider_id) = self.oauth_provider {
             if let Some(ref token_store) = self.token_store {
-                // Try to get token from store
+                // Fast path: token is valid, no lock needed.
                 if let Some(token) = token_store.get(oauth_provider_id) {
-                    // Check if token needs refresh
-                    if token.needs_refresh() {
-                        tracing::info!("🔄 Token for '{}' needs refresh, refreshing...", oauth_provider_id);
-
-                        // Refresh token
-                        let config = OAuthConfig::anthropic();
-                        let oauth_client = OAuthClient::new(config, token_store.clone());
-
-                        match oauth_client.refresh_token(oauth_provider_id).await {
-                            Ok(new_token) => {
-                                tracing::info!("✅ Token refreshed successfully");
-                                return Ok(new_token.access_token.expose_secret().to_string());
-                            }
-                            Err(e) => {
-                                tracing::error!("❌ Failed to refresh token: {}", e);
-                                return Err(ProviderError::AuthError(format!(
-                                    "Failed to refresh OAuth token: {}", e
-                                )));
-                            }
-                        }
-                    } else {
-                        // Token is still valid
+                    if !token.needs_refresh() {
                         return Ok(token.access_token.expose_secret().to_string());
+                    }
+                }
+
+                // Slow path: token needs refresh.  Acquire the per-provider
+                // lock so only one refresh request is in-flight at a time.
+                let lock = token_store.get_refresh_lock(oauth_provider_id);
+                let _guard = lock.lock().await;
+
+                // Double-checked: another task may have refreshed while we waited.
+                if let Some(token) = token_store.get(oauth_provider_id) {
+                    if !token.needs_refresh() {
+                        return Ok(token.access_token.expose_secret().to_string());
+                    }
+
+                    tracing::info!("🔄 Token for '{}' needs refresh, refreshing...", oauth_provider_id);
+
+                    let config = OAuthConfig::anthropic();
+                    let oauth_client = OAuthClient::new(config, token_store.clone());
+
+                    match oauth_client.refresh_token(oauth_provider_id).await {
+                        Ok(new_token) => {
+                            tracing::info!("✅ Token refreshed successfully");
+                            return Ok(new_token.access_token.expose_secret().to_string());
+                        }
+                        Err(e) => {
+                            tracing::error!("❌ Failed to refresh token: {}", e);
+                            return Err(ProviderError::AuthError(format!(
+                                "Failed to refresh OAuth token: {}",
+                                e
+                            )));
+                        }
                     }
                 } else {
                     return Err(ProviderError::AuthError(format!(
@@ -274,7 +292,7 @@ impl AnthropicCompatibleProvider {
                 }
             } else {
                 return Err(ProviderError::AuthError(
-                    "OAuth provider configured but TokenStore not available".to_string()
+                    "OAuth provider configured but TokenStore not available".to_string(),
                 ));
             }
         }

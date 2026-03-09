@@ -1,11 +1,11 @@
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use secrecy::{SecretString, ExposeSecret};
 
 /// Serialize SecretString for storage
 fn serialize_secret<S>(secret: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
@@ -30,10 +30,16 @@ pub struct OAuthToken {
     /// Provider ID (e.g., "claude-max", "anthropic-oauth")
     pub provider_id: String,
     /// OAuth access token (stored securely)
-    #[serde(serialize_with = "serialize_secret", deserialize_with = "deserialize_secret")]
+    #[serde(
+        serialize_with = "serialize_secret",
+        deserialize_with = "deserialize_secret"
+    )]
     pub access_token: SecretString,
     /// OAuth refresh token (stored securely)
-    #[serde(serialize_with = "serialize_secret", deserialize_with = "deserialize_secret")]
+    #[serde(
+        serialize_with = "serialize_secret",
+        deserialize_with = "deserialize_secret"
+    )]
     pub refresh_token: SecretString,
     /// Token expiration time (UTC)
     pub expires_at: DateTime<Utc>,
@@ -66,6 +72,16 @@ pub struct TokenStore {
     file_path: PathBuf,
     /// In-memory cache of tokens
     tokens: Arc<RwLock<HashMap<String, OAuthToken>>>,
+    /// Per-provider mutex to serialise token refreshes.
+    ///
+    /// Without this, every concurrent request that finds `needs_refresh() == true`
+    /// will simultaneously send a refresh request to the provider.  Because
+    /// Anthropic rotates refresh tokens on use, the first request wins and all
+    /// others receive `invalid_grant`, poisoning the session until manual
+    /// re-authentication.  Holding this lock for the duration of a refresh (and
+    /// re-checking the token state immediately after acquiring it) ensures only
+    /// one refresh happens per provider per expiry cycle.
+    refresh_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl TokenStore {
@@ -73,10 +89,8 @@ impl TokenStore {
     /// Loads existing tokens from file if it exists
     pub fn new(file_path: PathBuf) -> Result<Self> {
         let tokens = if file_path.exists() {
-            let content = fs::read_to_string(&file_path)
-                .context("Failed to read token file")?;
-            serde_json::from_str(&content)
-                .context("Failed to parse token file")?
+            let content = fs::read_to_string(&file_path).context("Failed to read token file")?;
+            serde_json::from_str(&content).context("Failed to parse token file")?
         } else {
             HashMap::new()
         };
@@ -84,17 +98,16 @@ impl TokenStore {
         Ok(Self {
             file_path,
             tokens: Arc::new(RwLock::new(tokens)),
+            refresh_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
     /// Get default token store path
     /// ~/.claude-code-mux/oauth_tokens.json
     pub fn default_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .context("Failed to get home directory")?;
+        let home = dirs::home_dir().context("Failed to get home directory")?;
         let config_dir = home.join(".claude-code-mux");
-        fs::create_dir_all(&config_dir)
-            .context("Failed to create config directory")?;
+        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
         Ok(config_dir.join("oauth_tokens.json"))
     }
 
@@ -110,7 +123,9 @@ impl TokenStore {
 
         // Update in-memory cache
         {
-            let mut tokens = self.tokens.write()
+            let mut tokens = self
+                .tokens
+                .write()
                 .expect("Token store lock poisoned during write - cannot proceed safely");
             tokens.insert(provider_id, token);
         }
@@ -123,7 +138,9 @@ impl TokenStore {
 
     /// Get token for a provider
     pub fn get(&self, provider_id: &str) -> Option<OAuthToken> {
-        let tokens = self.tokens.read()
+        let tokens = self
+            .tokens
+            .read()
             .expect("Token store lock poisoned during read - cannot proceed safely");
         tokens.get(provider_id).cloned()
     }
@@ -131,7 +148,9 @@ impl TokenStore {
     /// Remove token for a provider
     pub fn remove(&self, provider_id: &str) -> Result<()> {
         {
-            let mut tokens = self.tokens.write()
+            let mut tokens = self
+                .tokens
+                .write()
                 .expect("Token store lock poisoned during write - cannot proceed safely");
             tokens.remove(provider_id);
         }
@@ -144,27 +163,48 @@ impl TokenStore {
 
     /// List all provider IDs that have tokens
     pub fn list_providers(&self) -> Vec<String> {
-        let tokens = self.tokens.read()
+        let tokens = self
+            .tokens
+            .read()
             .expect("Token store lock poisoned during read - cannot proceed safely");
         tokens.keys().cloned().collect()
     }
 
     /// Get all tokens
     pub fn all(&self) -> HashMap<String, OAuthToken> {
-        let tokens = self.tokens.read()
+        let tokens = self
+            .tokens
+            .read()
             .expect("Token store lock poisoned during read - cannot proceed safely");
         tokens.clone()
     }
 
+    /// Return the per-provider async mutex used to serialise token refreshes.
+    ///
+    /// All callers that share the same `TokenStore` (and therefore the same
+    /// `Arc`) will receive the same `Arc<tokio::sync::Mutex<()>>` for a given
+    /// `provider_id`, so the mutual-exclusion guarantee holds even when the
+    /// `TokenStore` value itself has been cloned.
+    pub fn get_refresh_lock(&self, provider_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .expect("refresh_locks mutex poisoned");
+        locks
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Persist tokens to file
     fn persist(&self) -> Result<()> {
-        let tokens = self.tokens.read()
+        let tokens = self
+            .tokens
+            .read()
             .expect("Token store lock poisoned during read - cannot proceed safely");
-        let json = serde_json::to_string_pretty(&*tokens)
-            .context("Failed to serialize tokens")?;
+        let json = serde_json::to_string_pretty(&*tokens).context("Failed to serialize tokens")?;
 
-        fs::write(&self.file_path, json)
-            .context("Failed to write token file")?;
+        fs::write(&self.file_path, json).context("Failed to write token file")?;
 
         // Set file permissions to 0600 (owner read/write only)
         #[cfg(unix)]

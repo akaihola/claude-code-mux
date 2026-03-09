@@ -8,6 +8,14 @@ use secrecy::{SecretString, ExposeSecret};
 
 use super::token_store::{OAuthToken, TokenStore};
 
+/// Return the last 8 characters of an OAuth token as a safe fingerprint for
+/// log messages.  Enough to tell tokens apart across log lines without leaking
+/// the full secret value.
+fn token_fingerprint(token: &str) -> &str {
+    let len = token.len();
+    if len >= 8 { &token[len - 8..] } else { token }
+}
+
 /// PKCE verifier for OAuth flow
 #[derive(Debug, Clone)]
 pub struct PKCEVerifier {
@@ -332,10 +340,24 @@ impl OAuthClient {
         Ok(token)
     }
 
-    /// Refresh an access token
+    /// Refresh an access token.
+    ///
+    /// On a permanent failure (`invalid_grant`) the stored token is removed so
+    /// that subsequent callers fail immediately with "re-authentication required"
+    /// instead of hammering Anthropic with the same dead refresh token on every
+    /// incoming request.
     pub async fn refresh_token(&self, provider_id: &str) -> Result<OAuthToken> {
         let existing_token = self.token_store.get(provider_id)
             .context("No token found for provider")?;
+
+        // Log a safe fingerprint of the token we're about to use so we can
+        // correlate success/failure lines and detect if the same dead token is
+        // being retried.
+        let rt_fp = token_fingerprint(existing_token.refresh_token.expose_secret()).to_owned();
+        tracing::info!(
+            "🔄 Refreshing '{}' token (rt: ...{}, expires_at: {})",
+            provider_id, rt_fp, existing_token.expires_at
+        );
 
         #[derive(Deserialize)]
         struct TokenResponse {
@@ -406,6 +428,28 @@ impl OAuthClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+
+            // invalid_grant means the refresh token has been permanently revoked
+            // by the provider (e.g. user logged into claude.ai in a browser,
+            // Anthropic session expiry, or a concurrent-refresh race that
+            // consumed the token first).  Remove it from the store immediately
+            // so callers fail fast with a clear "re-auth required" message
+            // instead of retrying indefinitely with the same dead token.
+            if body.contains("invalid_grant") {
+                tracing::error!(
+                    "🔐 Refresh token for '{}' is permanently invalid \
+                     (rt: ...{}, expires_at: {}). Clearing stored token – \
+                     re-authentication required.",
+                    provider_id, rt_fp, existing_token.expires_at
+                );
+                let _ = self.token_store.remove(provider_id);
+                return Err(anyhow!(
+                    "Refresh token invalid – re-authentication required for '{}'. \
+                     Run the OAuth flow again (e.g. ccm model add or the admin UI).",
+                    provider_id
+                ));
+            }
+
             return Err(anyhow!("Token refresh failed: {} - {}", status, body));
         }
 
@@ -419,20 +463,34 @@ impl OAuthClient {
 
         let expires_at = Utc::now() + chrono::Duration::seconds(token_response.expires_in);
 
+        let new_refresh = token_response.refresh_token
+            .map(SecretString::new)
+            .unwrap_or_else(|| existing_token.refresh_token.clone());
+
+        let new_rt_fp = token_fingerprint(new_refresh.expose_secret()).to_owned();
+
         let token = OAuthToken {
             provider_id: provider_id.to_string(),
             access_token: SecretString::new(token_response.access_token),
-            // Use new refresh_token if provided, otherwise keep existing one (Google doesn't return new one)
-            refresh_token: token_response.refresh_token
-                .map(SecretString::new)
-                .unwrap_or(existing_token.refresh_token),
+            // Use new refresh_token if provided, otherwise keep existing one
+            // (Google doesn't return a new one on every refresh).
+            refresh_token: new_refresh,
             expires_at,
             enterprise_url: existing_token.enterprise_url,
-            project_id: existing_token.project_id,  // Preserve project_id from existing token
+            project_id: existing_token.project_id,
         };
 
         // Save refreshed token
         self.token_store.save(token.clone())?;
+
+        let rt_rotated = new_rt_fp != rt_fp;
+        tracing::info!(
+            "✅ Token refreshed for '{}' (new rt: ...{}{}, new expires_at: {})",
+            provider_id,
+            new_rt_fp,
+            if rt_rotated { " [rotated]" } else { " [unchanged]" },
+            expires_at
+        );
 
         Ok(token)
     }
