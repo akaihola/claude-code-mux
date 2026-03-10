@@ -275,4 +275,21 @@ mod tests {
         assert!(!valid_token.is_expired());
         assert!(!valid_token.needs_refresh());
     }
+
+    #[test]
+    fn test_get_refresh_lock_is_stable_per_provider() {
+        let path = std::env::temp_dir().join("ccm_test_refresh_lock_2026.json");
+        let store = TokenStore::new(path).unwrap();
+        let lock_a1 = store.get_refresh_lock("provider-a");
+        let lock_a2 = store.get_refresh_lock("provider-a");
+        let lock_b = store.get_refresh_lock("provider-b");
+        assert!(
+            std::sync::Arc::ptr_eq(&lock_a1, &lock_a2),
+            "same provider must reuse the same mutex"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&lock_a1, &lock_b),
+            "different providers must have independent mutexes"
+        );
+    }
 }

@@ -653,4 +653,12 @@ mod tests {
         assert!(auth_url.url.contains("code_challenge_method=S256"));
         assert!(auth_url.url.contains("scope="));
     }
+
+    #[test]
+    fn test_token_fingerprint_returns_last_8_chars() {
+        assert_eq!(token_fingerprint("abcdefgh"), "abcdefgh");    // exactly 8
+        assert_eq!(token_fingerprint("0123456789"), "23456789");   // 10 chars → last 8
+        assert_eq!(token_fingerprint("abc"), "abc");               // shorter than 8
+        assert_eq!(token_fingerprint(""), "");                     // empty
+    }
 }
