@@ -11,6 +11,11 @@ use super::token_store::{OAuthToken, TokenStore};
 /// Return the last 8 characters of an OAuth token as a safe fingerprint for
 /// log messages.  Enough to tell tokens apart across log lines without leaking
 /// the full secret value.
+///
+/// # Safety
+/// Uses byte-index slicing (`&str[n..]`), which is correct here because OAuth
+/// access/refresh tokens are always ASCII (base64url or hex).  Do not call this
+/// on arbitrary Unicode strings.
 fn token_fingerprint(token: &str) -> &str {
     let len = token.len();
     if len >= 8 { &token[len - 8..] } else { token }
@@ -340,16 +345,28 @@ impl OAuthClient {
         Ok(token)
     }
 
-    /// Refresh an access token.
+    /// Refresh an access token, re-reading the current value from the store.
+    /// Prefer `refresh_token_with` when you already hold the token to avoid
+    /// a second store read inside the same lock window.
+    pub async fn refresh_token(&self, provider_id: &str) -> Result<OAuthToken> {
+        let existing_token = self.token_store.get(provider_id)
+            .context("No token found for provider")?;
+        self.refresh_token_with(provider_id, existing_token).await
+    }
+
+    /// Refresh an access token using an already-fetched `existing_token`.
+    /// The caller is responsible for ensuring `existing_token` is the current
+    /// value from the store (i.e. retrieved while holding the refresh lock).
     ///
     /// On a permanent failure (`invalid_grant`) the stored token is removed so
     /// that subsequent callers fail immediately with "re-authentication required"
     /// instead of hammering Anthropic with the same dead refresh token on every
     /// incoming request.
-    pub async fn refresh_token(&self, provider_id: &str) -> Result<OAuthToken> {
-        let existing_token = self.token_store.get(provider_id)
-            .context("No token found for provider")?;
-
+    pub async fn refresh_token_with(
+        &self,
+        provider_id: &str,
+        existing_token: OAuthToken,
+    ) -> Result<OAuthToken> {
         // Log a safe fingerprint of the token we're about to use so we can
         // correlate success/failure lines and detect if the same dead token is
         // being retried.
@@ -435,14 +452,23 @@ impl OAuthClient {
             // consumed the token first).  Remove it from the store immediately
             // so callers fail fast with a clear "re-auth required" message
             // instead of retrying indefinitely with the same dead token.
-            if body.contains("invalid_grant") {
+            let is_invalid_grant = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|e| e == "invalid_grant"))
+                .unwrap_or(false);
+            if is_invalid_grant {
                 tracing::error!(
                     "🔐 Refresh token for '{}' is permanently invalid \
                      (rt: ...{}, expires_at: {}). Clearing stored token – \
                      re-authentication required.",
                     provider_id, rt_fp, existing_token.expires_at
                 );
-                let _ = self.token_store.remove(provider_id);
+                if let Err(e) = self.token_store.remove(provider_id) {
+                    tracing::warn!(
+                        "⚠️ Failed to persist removal of dead token for '{}': {}",
+                        provider_id, e
+                    );
+                }
                 return Err(anyhow!(
                     "Refresh token invalid – re-authentication required for '{}'. \
                      Run the OAuth flow again (e.g. ccm model add or the admin UI).",
@@ -579,49 +605,6 @@ impl OAuthClient {
             .ok_or_else(|| anyhow!("No project ID available. Set GOOGLE_CLOUD_PROJECT environment variable."))
     }
 
-    /// Get a valid access token (refreshing if needed)
-    #[allow(dead_code)]
-    pub async fn get_valid_token(&self, provider_id: &str) -> Result<String> {
-        let token = self.token_store.get(provider_id)
-            .context("No token found for provider")?;
-
-        if token.needs_refresh() {
-            let refreshed = self.refresh_token(provider_id).await?;
-            Ok(refreshed.access_token.expose_secret().to_string())
-        } else {
-            Ok(token.access_token.expose_secret().to_string())
-        }
-    }
-
-    /// Create an API key using OAuth token (for Anthropic Console flow)
-    #[allow(dead_code)]
-    pub async fn create_api_key(&self, provider_id: &str) -> Result<String> {
-        let access_token = self.get_valid_token(provider_id).await?;
-
-        #[derive(Deserialize)]
-        struct ApiKeyResponse {
-            raw_key: String,
-        }
-
-        let response = self.http_client
-            .post("https://api.anthropic.com/api/oauth/claude_cli/create_api_key")
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await
-            .context("Failed to create API key")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("API key creation failed: {} - {}", status, body));
-        }
-
-        let api_key_response: ApiKeyResponse = response.json().await
-            .context("Failed to parse API key response")?;
-
-        Ok(api_key_response.raw_key)
-    }
 }
 
 #[cfg(test)]

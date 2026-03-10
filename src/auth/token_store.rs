@@ -155,6 +155,14 @@ impl TokenStore {
             tokens.remove(provider_id);
         }
 
+        // Also remove the refresh lock for this provider so it doesn't
+        // accumulate stale entries after token deletion.
+        {
+            if let Ok(mut locks) = self.refresh_locks.lock() {
+                locks.remove(provider_id);
+            }
+        }
+
         // Persist to file
         self.persist()?;
 

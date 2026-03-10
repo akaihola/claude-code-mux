@@ -271,7 +271,7 @@ impl AnthropicCompatibleProvider {
                     let config = OAuthConfig::anthropic();
                     let oauth_client = OAuthClient::new(config, token_store.clone());
 
-                    match oauth_client.refresh_token(oauth_provider_id).await {
+                    match oauth_client.refresh_token_with(oauth_provider_id, token).await {
                         Ok(new_token) => {
                             tracing::info!("✅ Token refreshed successfully");
                             return Ok(new_token.access_token.expose_secret().to_string());
