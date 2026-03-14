@@ -77,6 +77,7 @@ impl OAuthConfig {
                 "org:create_api_key".to_string(),
                 "user:profile".to_string(),
                 "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
             ],
         }
     }
