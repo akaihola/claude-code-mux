@@ -3,11 +3,21 @@
 //! Without this, tokens are only refreshed lazily when a request arrives.  If no
 //! request arrives during the ~5-minute pre-expiry window the refresh token
 //! becomes invalid (Anthropic rotates on use), requiring manual re-auth.
+//!
+//! Also syncs Anthropic tokens from Claude Code's credential file
+//! (`~/.claude/.credentials.json`).  Claude Code's OAuth flow produces tokens
+//! with full model access (Sonnet, Opus) because it uses a localhost redirect_uri.
+//! CCM cannot replicate this flow when accessed remotely, so it reads Claude
+//! Code's token instead.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::auth::{OAuthClient, OAuthConfig, TokenStore};
+use crate::auth::token_store::OAuthToken;
 use crate::providers::{AuthType, ProviderConfig};
+use chrono::{TimeZone, Utc};
+use secrecy::{ExposeSecret, SecretString};
 
 /// Map a provider type string to the matching `OAuthConfig`.
 pub fn oauth_config_for_provider_type(provider_type: &str) -> Option<OAuthConfig> {
@@ -108,6 +118,100 @@ async fn refresh_if_needed(
     }
 }
 
+/// Path to Claude Code's credential file.
+fn claude_code_credentials_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join(".credentials.json"))
+}
+
+/// Sync a single Anthropic OAuth provider's token from Claude Code's credentials.
+///
+/// Claude Code's OAuth flow uses a localhost redirect_uri which produces tokens
+/// with full model access (Sonnet/Opus on Max plans).  CCM's remote admin UI
+/// cannot use localhost redirects, so its own OAuth tokens only get Haiku access.
+///
+/// This function reads Claude Code's token and updates CCM's token store if the
+/// Claude Code token is newer or if CCM's token is about to expire.
+fn sync_from_claude_code(provider_id: &str, token_store: &TokenStore) {
+    let creds_path = match claude_code_credentials_path() {
+        Some(p) if p.exists() => p,
+        _ => return,
+    };
+
+    let content = match std::fs::read_to_string(&creds_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("[proactive] cannot read Claude Code credentials: {}", e);
+            return;
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("[proactive] cannot parse Claude Code credentials: {}", e);
+            return;
+        }
+    };
+
+    let oauth = match json.get("claudeAiOauth") {
+        Some(v) => v,
+        None => return,
+    };
+
+    let cc_access = match oauth.get("accessToken").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let cc_refresh = match oauth.get("refreshToken").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let cc_expires_ms = match oauth.get("expiresAt").and_then(|v| v.as_i64()) {
+        Some(ms) => ms,
+        None => return,
+    };
+    let cc_expires_at = Utc.timestamp_millis_opt(cc_expires_ms).single().unwrap_or_else(Utc::now);
+
+    // Skip if Claude Code's token is expired.
+    if cc_expires_at <= Utc::now() {
+        tracing::debug!("[proactive] Claude Code token is expired, skipping sync");
+        return;
+    }
+
+    // Check if we need to update: either no CCM token, or CC token is different and fresher.
+    if let Some(existing) = token_store.get(provider_id) {
+        // Same token – nothing to do.
+        if existing.access_token.expose_secret() == cc_access {
+            return;
+        }
+        // CCM token is still fresh and we don't know if CC's is better – only
+        // replace if CCM token needs refresh or CC token expires later.
+        if !existing.needs_refresh() && cc_expires_at <= existing.expires_at {
+            return;
+        }
+    }
+
+    let token = OAuthToken {
+        provider_id: provider_id.to_string(),
+        access_token: SecretString::new(cc_access.to_string()),
+        refresh_token: SecretString::new(cc_refresh.to_string()),
+        expires_at: cc_expires_at,
+        enterprise_url: None,
+        project_id: None,
+    };
+
+    if let Err(e) = token_store.save(token) {
+        tracing::warn!("[proactive] failed to save synced Claude Code token: {}", e);
+        return;
+    }
+
+    tracing::info!(
+        "[proactive] synced Claude Code token for '{}' (expires_at: {})",
+        provider_id,
+        cc_expires_at,
+    );
+}
+
 /// Spawn the background refresh loop.
 ///
 /// Checks all OAuth tokens every 60 seconds and refreshes any that are within
@@ -130,15 +234,33 @@ pub fn spawn(
         oauth_map.keys().cloned().collect::<Vec<_>>().join(", ")
     );
 
+    // Identify which providers are Anthropic (eligible for Claude Code token sync).
+    let anthropic_providers: Vec<String> = oauth_map
+        .iter()
+        .filter(|(_, cfg)| cfg.client_id == "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    // Do an initial sync immediately so CCM picks up Claude Code's token on startup.
+    for provider_id in &anthropic_providers {
+        sync_from_claude_code(provider_id, &token_store);
+    }
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         // The first tick completes immediately – skip it so we don't refresh
-        // right at startup (the tokens were just loaded).
+        // right at startup (the tokens were just loaded / synced).
         interval.tick().await;
 
         loop {
             interval.tick().await;
 
+            // Sync from Claude Code first (Anthropic providers only).
+            for provider_id in &anthropic_providers {
+                sync_from_claude_code(provider_id, &token_store);
+            }
+
+            // Then do normal proactive refresh for all providers.
             for (provider_id, oauth_config) in &oauth_map {
                 refresh_if_needed(provider_id, oauth_config, &token_store).await;
             }

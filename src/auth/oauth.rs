@@ -71,12 +71,11 @@ impl OAuthConfig {
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
             client_secret: None,  // PKCE-based public client
             auth_url: "https://claude.ai/oauth/authorize".to_string(),
-            token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
+            token_url: "https://api.anthropic.com/v1/oauth/token".to_string(),
             redirect_uri: "https://console.anthropic.com/oauth/code/callback".to_string(),
             scopes: vec![
-                "org:create_api_key".to_string(),
-                "user:profile".to_string(),
                 "user:inference".to_string(),
+                "user:profile".to_string(),
                 "user:sessions:claude_code".to_string(),
             ],
         }
@@ -125,7 +124,7 @@ impl OAuthConfig {
             client_secret: Some("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".to_string()),
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
             token_url: "https://oauth2.googleapis.com/token".to_string(),
-            redirect_uri: "http://localhost:13456/api/oauth/callback".to_string(),
+            redirect_uri: "https://console.anthropic.com/oauth/code/callback".to_string(),
             scopes: vec![
                 "https://www.googleapis.com/auth/cloud-platform".to_string(),
                 "https://www.googleapis.com/auth/userinfo.email".to_string(),

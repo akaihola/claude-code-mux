@@ -148,6 +148,7 @@ pub async fn start_server(config: AppConfig, config_path: std::path::PathBuf) ->
         .route("/api/oauth/authorize", post(oauth_handlers::oauth_authorize))
         .route("/api/oauth/exchange", post(oauth_handlers::oauth_exchange))
         .route("/api/oauth/callback", get(oauth_handlers::oauth_callback))
+        .route("/callback", get(oauth_handlers::oauth_callback))  // Anthropic OAuth redirect
         .route("/auth/callback", get(oauth_handlers::oauth_callback))  // OpenAI Codex uses this path
         .route("/api/oauth/tokens", get(oauth_handlers::oauth_list_tokens))
         .route("/api/oauth/tokens/delete", post(oauth_handlers::oauth_delete_token))
