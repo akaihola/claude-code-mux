@@ -163,6 +163,9 @@ pub async fn start_server(config: AppConfig, config_path: std::path::PathBuf) ->
 
     info!("🚀 Server listening on {}", addr);
 
+    // Start proactive OAuth token refresh (prevents expiry during idle periods)
+    crate::auth::spawn_proactive_refresh(oauth_state.token_store.clone(), &config.providers);
+
     // Start OAuth callback server on port 1455 (required for OpenAI Codex)
     // This is necessary because OpenAI's OAuth app only allows localhost:1455/auth/callback
     tokio::spawn(async move {
