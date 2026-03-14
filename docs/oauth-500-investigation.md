@@ -203,12 +203,48 @@ A permanent solution would be to either:
 1. Fix CCM's OAuth flow to produce tokens with full capabilities, OR
 2. Implement token syncing from Claude Code's credential file
 
+## Localhost Redirect – Tested and Failed
+
+Attempted `redirect_uri=http://localhost:13456/callback` (matching Claude Code's
+pattern).  Results:
+
+- `http://localhost:13456/api/oauth/callback` → rejected: "not supported by client"
+- `http://localhost:13456/callback` → accepted by Anthropic's OAuth server, but
+  the browser redirect fails because CCM runs on `gogo` (remote server) while
+  the browser runs on the user's laptop.  `localhost:13456` in the browser
+  doesn't reach CCM.
+
+Claude Code's localhost redirect works because it runs on the same machine as
+the browser.  CCM cannot replicate this when administered remotely.
+
+## Token Sync Implemented
+
+Automatic token syncing from `~/.claude/.credentials.json` is implemented in
+`src/auth/proactive_refresh.rs`.  Every 60 seconds (and once at startup), CCM
+reads Claude Code's credential file and updates its token store if Claude Code
+has a fresher token.
+
+## Anomaly: Token Works Then Stops
+
+During testing, Claude Code's token was copied into CCM and worked for Sonnet
+for several minutes.  Later, the **same token** (verified by suffix match)
+started returning 500 again for Sonnet while still working for Haiku.  Yet
+Claude Code itself continued working with the same token.
+
+This suggests:
+1. Anthropic may track per-token state server-side and revoke Sonnet/Opus access
+   after detecting unusual patterns (many failed requests from other tokens on
+   the same account), OR
+2. The Anthropic TypeScript SDK sends a header or request parameter that curl
+   does not, and this is required for Sonnet/Opus access – not just the token
+   itself
+
 ## Still Open
 
-- Does `redirect_uri=http://localhost:13456/api/oauth/callback` fix the 500?
-  (Testing in progress – the redirect_uri must be registered with Anthropic's
-  OAuth app for the authorize step to succeed)
-- If localhost redirect doesn't work, implement automatic token sync from
-  `~/.claude/.credentials.json`
+- Why does Claude Code's token work in the TS SDK but not via curl/reqwest for
+  Sonnet/Opus?  The token is identical.  Possible: a required header from the
+  Anthropic TS SDK that we haven't identified.
 - The `user:mcp_servers` scope is present in Claude Code but not yet in CCM –
   unclear if it affects model access
+- Consider adding an `x-client-name: claude-code` header to CCM's requests, as
+  the TS SDK likely sends this and Anthropic may gate model access on it
