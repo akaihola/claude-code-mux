@@ -71,11 +71,12 @@ impl OAuthConfig {
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
             client_secret: None,  // PKCE-based public client
             auth_url: "https://claude.ai/oauth/authorize".to_string(),
-            token_url: "https://api.anthropic.com/v1/oauth/token".to_string(),
+            token_url: "https://console.anthropic.com/v1/oauth/token".to_string(),
             redirect_uri: "https://console.anthropic.com/oauth/code/callback".to_string(),
             scopes: vec![
-                "user:inference".to_string(),
+                "org:create_api_key".to_string(),
                 "user:profile".to_string(),
+                "user:inference".to_string(),
                 "user:sessions:claude_code".to_string(),
             ],
         }

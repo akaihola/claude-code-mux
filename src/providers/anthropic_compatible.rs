@@ -366,6 +366,7 @@ impl AnthropicCompatibleProvider {
             req_builder = req_builder
                 .header("Authorization", format!("Bearer {}", auth_value))
                 .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01")
+                .header("anthropic-product", "claude-code")
                 .header("x-app", "cli")
                 .header("User-Agent", "claude-cli/2.1.76 (external, cli)");
         } else {
@@ -417,6 +418,7 @@ impl AnthropicCompatibleProvider {
             req_builder = req_builder
                 .header("Authorization", format!("Bearer {}", auth_value))
                 .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01")
+                .header("anthropic-product", "claude-code")
                 .header("x-app", "cli")
                 .header("User-Agent", "claude-cli/2.1.76 (external, cli)");
         } else {
@@ -497,6 +499,7 @@ impl AnthropicProvider for AnthropicCompatibleProvider {
                 req_builder = req_builder
                     .header("Authorization", format!("Bearer {}", auth_value))
                     .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01")
+                .header("anthropic-product", "claude-code")
                 .header("x-app", "cli")
                 .header("User-Agent", "claude-cli/2.1.76 (external, cli)");
             } else {
