@@ -1,6 +1,6 @@
 # OAuth 500 Investigation – Claude Max Sonnet/Opus Access
 
-## Date: 2026-03-14
+## Date: 2026-03-14 to 2026-03-15
 
 ## Summary
 
@@ -9,10 +9,42 @@ CCM's OAuth tokens for Claude Max (`claude-max` provider) produce HTTP 500
 models.  Haiku 4.5 works fine.  Claude Code on the same machine, same user,
 same plan works perfectly with all models.
 
-## Root Cause (confirmed)
+## Root Cause (CONFIRMED 2026-03-15)
 
-The 500 is caused by the **OAuth token itself** – not by request headers, beta
-flags, tool ID sanitization, or request body formatting.
+Anthropic **requires the system prompt to start with "You are Claude Code,
+Anthropic's official CLI for Claude."** for OAuth tokens to access Sonnet and
+Opus models on Max plans.  Without this system prompt, the API returns 500
+"Internal server error" for these models (Haiku works without it).
+
+This was the ONLY issue.  The token, scopes, redirect_uri, token_url, and
+headers were all fine.  The 500 appeared in our testing because we used `curl`
+with simple test messages that had no system prompt.  Claude Code requests
+proxied through CCM already include this system prompt and work correctly.
+
+**Proof:**
+```bash
+# Without system prompt → 500
+curl -s https://api.anthropic.com/v1/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":20,"messages":[{"role":"user","content":"hi"}]}'
+# → {"type":"error","error":{"type":"api_error","message":"Internal server error"}}
+
+# With system prompt → works
+curl -s https://api.anthropic.com/v1/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":20,"system":"You are Claude Code, Anthropic'\''s official CLI for Claude.","messages":[{"role":"user","content":"hi"}]}'
+# → {"content":[{"type":"text","text":"Hi! How can I help you today?"}],...}
+```
+
+## Earlier Incorrect Hypothesis
+
+The 500 was initially attributed to the **OAuth token itself** having different
+capabilities based on the redirect_uri.  This was wrong – all tokens work for
+Sonnet/Opus when the system prompt is present.
 
 **Proof:**  Copying Claude Code's token (`~/.claude/.credentials.json`) into
 CCM's token store (`~/.claude-code-mux/oauth_tokens.json`) and restarting CCM
