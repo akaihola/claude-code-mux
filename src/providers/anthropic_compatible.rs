@@ -185,6 +185,51 @@ fn sanitize_tool_id(id: &str) -> String {
         .collect()
 }
 
+/// Required system prompt prefix for OAuth tokens on Claude Max plans.
+/// Anthropic gates Sonnet/Opus access behind this — without it, the API
+/// returns 500 "Internal server error" for these models.
+const CLAUDE_CODE_SYSTEM_PREFIX: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Ensure the request's system prompt starts with the Claude Code identity
+/// string required by Anthropic for OAuth tokens to access Sonnet/Opus.
+fn ensure_claude_code_system_prompt(request: &mut AnthropicRequest) {
+    let already_present = match &request.system {
+        Some(crate::models::SystemPrompt::Text(t)) => t.contains(CLAUDE_CODE_SYSTEM_PREFIX),
+        Some(crate::models::SystemPrompt::Blocks(blocks)) => {
+            blocks.iter().any(|b| b.text.contains(CLAUDE_CODE_SYSTEM_PREFIX))
+        }
+        None => false,
+    };
+
+    if already_present {
+        return;
+    }
+
+    let prefix_block = crate::models::SystemBlock {
+        r#type: "text".to_string(),
+        text: CLAUDE_CODE_SYSTEM_PREFIX.to_string(),
+        cache_control: None,
+    };
+
+    match &mut request.system {
+        Some(crate::models::SystemPrompt::Blocks(blocks)) => {
+            blocks.insert(0, prefix_block);
+        }
+        Some(crate::models::SystemPrompt::Text(t)) => {
+            let combined = format!("{}\n\n{}", CLAUDE_CODE_SYSTEM_PREFIX, t);
+            *t = combined;
+        }
+        None => {
+            request.system = Some(crate::models::SystemPrompt::Text(
+                CLAUDE_CODE_SYSTEM_PREFIX.to_string(),
+            ));
+        }
+    }
+
+    tracing::debug!("Injected Claude Code system prompt prefix for OAuth request");
+}
+
 /// Generic Anthropic-compatible provider
 /// Works with: Anthropic, OpenRouter, z.ai, Minimax, etc.
 /// Any provider that accepts Anthropic Messages API format
@@ -461,6 +506,9 @@ impl AnthropicProvider for AnthropicCompatibleProvider {
         if is_anthropic {
             strip_non_anthropic_thinking(&mut request);
         }
+        if self.is_oauth() {
+            ensure_claude_code_system_prompt(&mut request);
+        }
 
         // Get authentication header value (API key or OAuth token)
         let auth_value = self.get_auth_header().await?;
@@ -583,6 +631,9 @@ impl AnthropicProvider for AnthropicCompatibleProvider {
         sanitize_tool_use_ids(&mut request, is_anthropic);
         if is_anthropic {
             strip_non_anthropic_thinking(&mut request);
+        }
+        if self.is_oauth() {
+            ensure_claude_code_system_prompt(&mut request);
         }
 
         // Get authentication header value

@@ -646,6 +646,16 @@ async fn handle_messages(
         })?;
 
     // 2. Route the request (may modify system prompt to remove CCM-SUBAGENT-MODEL tag)
+    // Debug: log system prompt presence for OAuth troubleshooting
+    let has_claude_code_system = match &request_for_routing.system {
+        Some(crate::models::SystemPrompt::Text(t)) => t.contains("You are Claude Code"),
+        Some(crate::models::SystemPrompt::Blocks(blocks)) => blocks.first().map_or(false, |b| b.text.contains("You are Claude Code")),
+        None => false,
+    };
+    if !has_claude_code_system {
+        debug!("⚠️ Request missing 'You are Claude Code' system prompt (required for OAuth Sonnet/Opus)");
+    }
+
     let decision = inner
         .router
         .route(&mut request_for_routing)
