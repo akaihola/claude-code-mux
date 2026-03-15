@@ -365,7 +365,9 @@ impl AnthropicCompatibleProvider {
         if self.is_oauth() {
             req_builder = req_builder
                 .header("Authorization", format!("Bearer {}", auth_value))
-                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01");
+                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01")
+                .header("x-app", "cli")
+                .header("User-Agent", "claude-cli/2.1.76 (external, cli)");
         } else {
             req_builder = req_builder.header("x-api-key", auth_value);
         }
@@ -414,7 +416,9 @@ impl AnthropicCompatibleProvider {
         if self.is_oauth() {
             req_builder = req_builder
                 .header("Authorization", format!("Bearer {}", auth_value))
-                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01");
+                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01")
+                .header("x-app", "cli")
+                .header("User-Agent", "claude-cli/2.1.76 (external, cli)");
         } else {
             req_builder = req_builder.header("x-api-key", auth_value);
         }
@@ -492,7 +496,9 @@ impl AnthropicProvider for AnthropicCompatibleProvider {
             if self.is_oauth() {
                 req_builder = req_builder
                     .header("Authorization", format!("Bearer {}", auth_value))
-                    .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01");
+                    .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01")
+                .header("x-app", "cli")
+                .header("User-Agent", "claude-cli/2.1.76 (external, cli)");
             } else {
                 req_builder = req_builder.header("x-api-key", auth_value);
             }
