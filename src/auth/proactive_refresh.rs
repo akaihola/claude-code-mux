@@ -260,15 +260,8 @@ pub fn spawn(
                 sync_from_claude_code(provider_id, &token_store);
             }
 
-            // Proactive refresh for non-Anthropic providers only.
-            // Anthropic tokens are managed by Claude Code via sync above –
-            // refreshing them here with CCM's OAuthConfig would produce
-            // console-type tokens that lack Sonnet/Opus access, or get
-            // invalid_grant because CC already rotated the refresh token.
+            // Proactive refresh for all providers.
             for (provider_id, oauth_config) in &oauth_map {
-                if anthropic_providers.contains(provider_id) {
-                    continue;
-                }
                 refresh_if_needed(provider_id, oauth_config, &token_store).await;
             }
         }

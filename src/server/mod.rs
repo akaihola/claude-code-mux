@@ -628,11 +628,6 @@ async fn handle_messages(
     // Generate trace ID for correlating request/response
     let trace_id = state.message_tracer.new_trace_id();
 
-    // DEBUG: Log request body for debugging
-    if let Ok(json_str) = serde_json::to_string_pretty(&request_json) {
-        tracing::debug!("📥 Incoming request body:\n{}", json_str);
-    }
-
     // 1. Parse request for routing decision (mutable for tag extraction)
     let mut request_for_routing: AnthropicRequest = serde_json::from_value(request_json.clone())
         .map_err(|e| {
